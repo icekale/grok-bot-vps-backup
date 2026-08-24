@@ -233,6 +233,7 @@ def _notify_job(kind, hid, ok, error=None, pack=""):
             last=read_last(hid),
             error=error,
             pack=pack,
+            fail=read_fail(hid) or {},
         )
     except Exception:
         pass

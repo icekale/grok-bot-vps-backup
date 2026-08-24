@@ -80,9 +80,11 @@ export GROK_BACKUP_ROOT=/home/box/backups
 
 `backup.success` · `backup.failed` · `restore.success` · `restore.failed` · `quark.success` · `quark.failed`，以及测试用的 `notify.test`。
 
-- **Telegram**：`POST https://api.telegram.org/bot<token>/sendMessage`，正文为短中文。
+- **Telegram**：`POST https://api.telegram.org/bot<token>/sendMessage`，正文为短中文一行。
 - **飞书 / Lark**：对自定义机器人 webhook `POST {"msg_type":"text","content":{"text":"..."}}`。
 - **通用 webhook**：`POST` `application/json`，`User-Agent: grok-bot-vps-backup`，`X-Webhook-Event: <event>`。若填写了签名密钥，另带 `X-Webhook-Signature: sha256=<hex>`，值为原始 body 的 HMAC-SHA256。
+
+Telegram / 飞书时间取备份或恢复本身的上海时间（`last.json` 的 `when`，或包名里的 `YYYYMMDD-HHMM`），不是发送通知的时钟。例如：`备份成功 example1 8/24 15:21  5s  44MB`、`备份失败 example2 8/24 15:21  ssh timeout`。
 
 ```json
 {
@@ -91,16 +93,17 @@ export GROK_BACKUP_ROOT=/home/box/backups
   "ok": true,
   "host_id": "example1",
   "host_name": "example1",
-  "file": "example1-20260824-1500.tgz",
-  "duration_sec": 12.3,
-  "bytes": 1048576,
-  "message": "备份成功: example1 · example1-20260824-1500.tgz",
+  "file": "example1-20260824-1521.tgz",
+  "duration_sec": 5,
+  "bytes": 46137344,
+  "message": "备份成功 example1 8/24 15:21  5s  44MB",
   "error": null,
-  "timestamp": "2026-08-24T15:00:00+08:00"
+  "when": "8/24 15:21",
+  "timestamp": "2026-08-24T15:21:08+08:00"
 }
 ```
 
-`event` 还可能是 `backup.failed`、`restore.success`、`restore.failed`、`quark.success`、`quark.failed`、`notify.test`。失败时 `ok` 为 `false`，`error` 为字符串。状态接口只回末四位密钥，不会回传 token 或带密钥的 URL。
+`event` 还可能是 `backup.failed`、`restore.success`、`restore.failed`、`quark.success`、`quark.failed`、`notify.test`。失败时 `ok` 为 `false`，`error` 为字符串。`when` 是备份/恢复的上海时间短写（如 `8/24 15:21`）；`timestamp` 是发出通知的时间。状态接口只回末四位密钥，不会回传 token 或带密钥的 URL。
 
 ## 安全说明
 

@@ -28,6 +28,7 @@ EVENTS = (
 CHANNELS = ("telegram", "feishu", "webhook")
 _TG_TOKEN_RE = re.compile(r"^[0-9A-Za-z_:-]{20,200}$")
 _CHAT_RE = re.compile(r"^@?[A-Za-z0-9_-]{1,64}$")
+_PACK_WHEN_RE = re.compile(r"(?:^|[^0-9])(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(?:[^0-9]|$)")
 _lock = threading.Lock()
 
 
@@ -266,6 +267,7 @@ def _webhook_payload(event, ctx):
         "bytes": int(_num(ctx.get("bytes"))),
         "message": _clip(ctx.get("message") or _zh_text(event, ctx), 300),
         "error": err,
+        "when": _when_display(ctx),
         "timestamp": ts,
     }
 
@@ -306,24 +308,102 @@ def _send_webhook(cfg, payload):
     return {"ok": False, "error": err or "send failed"}
 
 
-def _zh_text(event, ctx):
+def _parse_when(*sources):
+    """Shanghai wall time from last.json `when` or pack YYYYMMDD-HHMM. Not the send clock."""
+    for raw in sources:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=TZ)
+            except ValueError:
+                pass
+        m = _PACK_WHEN_RE.search(text)
+        if not m:
+            continue
+        try:
+            return datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), tzinfo=TZ,
+            )
+        except ValueError:
+            continue
+    return None
+
+
+def _fmt_when(dt):
+    if not dt:
+        return ""
+    return f"{dt.month}/{dt.day} {dt.hour:02d}:{dt.minute:02d}"
+
+
+def _when_display(ctx):
+    existing = _clip(ctx.get("when"), 32)
+    if existing and _PACK_WHEN_RE.search(existing) is None:
+        parsed = _parse_when(existing)
+        if parsed:
+            return _fmt_when(parsed)
+        if re.match(r"^\d{1,2}/\d{1,2} \d{2}:\d{2}$", existing):
+            return existing
+    dt = _parse_when(ctx.get("when"), ctx.get("file"))
+    return _fmt_when(dt)
+
+
+def _fmt_dur(sec):
+    n = _num(sec)
+    if n <= 0:
+        return ""
+    return f"{int(round(n))}s"
+
+
+def _fmt_size(n):
+    n = int(_num(n))
+    if n <= 0:
+        return ""
+    units = ((1073741824, "GB"), (1048576, "MB"), (1024, "KB"))
+    for step, suffix in units:
+        if n >= step:
+            v = n / step
+            if abs(v - round(v)) < 0.05:
+                return f"{int(round(v))}{suffix}"
+            return f"{v:.1f}{suffix}"
+    return f"{n}B"
+
+
+def _line(verb, ctx, tails):
+    head = [verb]
     name = _clip(ctx.get("host_name") or ctx.get("host_id"), 40)
-    fname = _clip(ctx.get("file"), 60)
-    err = _clip(ctx.get("error"), 80)
-    if event == "backup.success":
-        return "备份成功" + (": " + name if name else "") + ((" · " + fname) if fname else "")
-    if event == "backup.failed":
-        return "备份失败" + (": " + name if name else "") + ((" · " + err) if err else "")
-    if event == "restore.success":
-        return "恢复成功" + (": " + name if name else "") + ((" · " + fname) if fname else "")
-    if event == "restore.failed":
-        return "恢复失败" + (": " + name if name else "") + ((" · " + err) if err else "")
-    if event == "quark.success":
-        return "夸克上传成功" + ((" · " + fname) if fname else "")
-    if event == "quark.failed":
-        return "夸克上传失败" + ((" · " + err) if err else "")
+    if name:
+        head.append(name)
+    when = _when_display(ctx)
+    if when:
+        head.append(when)
+    text = " ".join(head)
+    bits = [b for b in tails if b]
+    if bits:
+        text += "  " + "  ".join(bits)
+    return text
+
+
+def _zh_text(event, ctx):
     if event == "notify.test":
         return "通知测试：Grok Bot VPS 备份"
+    err = _clip(ctx.get("error"), 80)
+    if event == "backup.success":
+        return _line("备份成功", ctx, [_fmt_dur(ctx.get("duration_sec")), _fmt_size(ctx.get("bytes"))])
+    if event == "backup.failed":
+        return _line("备份失败", ctx, [err])
+    if event == "restore.success":
+        return _line("恢复成功", ctx, [_fmt_dur(ctx.get("duration_sec")), _fmt_size(ctx.get("bytes"))])
+    if event == "restore.failed":
+        return _line("恢复失败", ctx, [err])
+    if event == "quark.success":
+        return _line("夸克上传成功", ctx, [_fmt_size(ctx.get("bytes"))])
+    if event == "quark.failed":
+        return _line("夸克上传失败", ctx, [err])
     return event
 
 
@@ -336,6 +416,7 @@ def send_event(event, ctx=None, channels=None):
         return {}
     if "ok" not in ctx:
         ctx["ok"] = event.endswith(".success") or event == "notify.test"
+    ctx["when"] = _when_display(ctx)
     if not ctx.get("message"):
         ctx["message"] = _zh_text(event, ctx)
     payload = _webhook_payload(event, ctx)
@@ -367,9 +448,10 @@ def emit(event, ctx=None):
     threading.Thread(target=_run, daemon=True).start()
 
 
-def emit_job(kind, host, ok, job=None, last=None, error=None, pack=""):
+def emit_job(kind, host, ok, job=None, last=None, error=None, pack="", fail=None):
     job = job or {}
     last = last or {}
+    fail = fail or {}
     hid = (host or {}).get("id") or ""
     name = (host or {}).get("name") or hid
     event = (("backup" if kind == "backup" else "restore") + (".success" if ok else ".failed"))
@@ -381,6 +463,16 @@ def emit_job(kind, host, ok, job=None, last=None, error=None, pack=""):
     if not size:
         size = last.get("size") or 0
     err = None if ok else (error or job.get("error") or "failed")
+    if kind == "restore":
+        when_dt = _parse_when(fname, last.get("when"), job.get("updated"))
+    elif ok:
+        when_dt = _parse_when(last.get("when"), fname, job.get("updated"))
+    else:
+        when_dt = _parse_when(
+            fail.get("when") or fail.get("last_attempt"),
+            job.get("updated"),
+            fname,
+        )
     emit(event, {
         "ok": bool(ok),
         "host_id": hid,
@@ -389,6 +481,7 @@ def emit_job(kind, host, ok, job=None, last=None, error=None, pack=""):
         "duration_sec": seconds,
         "bytes": size,
         "error": err,
+        "when": _fmt_when(when_dt),
     })
 
 
@@ -415,7 +508,7 @@ def emit_quark(result):
         "duration_sec": 0,
         "bytes": total,
         "error": None if ok else (result.get("message") or "上传失败"),
-        "message": "夸克上传成功" if ok else "夸克上传失败",
+        "when": _fmt_when(_parse_when(fname)),
     })
 
 
