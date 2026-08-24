@@ -80,9 +80,11 @@ Events (all on by default; you can turn successes off):
 
 `backup.success` · `backup.failed` · `restore.success` · `restore.failed` · `quark.success` · `quark.failed`, plus `notify.test` for the test button.
 
-- **Telegram**: `POST https://api.telegram.org/bot<token>/sendMessage` with a short Chinese text.
+- **Telegram**: `POST https://api.telegram.org/bot<token>/sendMessage` with a short Chinese one-liner.
 - **Feishu / Lark**: POST `{"msg_type":"text","content":{"text":"..."}}` to the custom-bot webhook.
 - **Generic webhook**: `POST` `application/json` with `User-Agent: grok-bot-vps-backup` and `X-Webhook-Event: <event>`. If a signing secret is set, also `X-Webhook-Signature: sha256=<hex>` (HMAC-SHA256 of the raw body).
+
+Telegram / Feishu time is the backup or restore's Shanghai local time (`when` in `last.json`, or `YYYYMMDD-HHMM` from the pack name), not the send clock. Examples: `备份成功 example1 8/24 15:21  5s  44MB`, `备份失败 example2 8/24 15:21  ssh timeout`.
 
 ```json
 {
@@ -91,16 +93,17 @@ Events (all on by default; you can turn successes off):
   "ok": true,
   "host_id": "example1",
   "host_name": "example1",
-  "file": "example1-20260824-1500.tgz",
-  "duration_sec": 12.3,
-  "bytes": 1048576,
-  "message": "备份成功: example1 · example1-20260824-1500.tgz",
+  "file": "example1-20260824-1521.tgz",
+  "duration_sec": 5,
+  "bytes": 46137344,
+  "message": "备份成功 example1 8/24 15:21  5s  44MB",
   "error": null,
-  "timestamp": "2026-08-24T15:00:00+08:00"
+  "when": "8/24 15:21",
+  "timestamp": "2026-08-24T15:21:08+08:00"
 }
 ```
 
-`event` may also be `backup.failed`, `restore.success`, `restore.failed`, `quark.success`, `quark.failed`, or `notify.test`. Failures set `ok` to `false` and `error` to a string. The status API returns only the last 4 characters of secrets, never the full token or webhook URL.
+`event` may also be `backup.failed`, `restore.success`, `restore.failed`, `quark.success`, `quark.failed`, or `notify.test`. Failures set `ok` to `false` and `error` to a string. `when` is the backup/restore Shanghai short time (e.g. `8/24 15:21`); `timestamp` is when the notify was sent. The status API returns only the last 4 characters of secrets, never the full token or webhook URL.
 
 ## Safety
 
