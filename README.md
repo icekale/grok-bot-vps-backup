@@ -1,3 +1,5 @@
+[English](README.en.md) · 中文
+
 # Grok Bot VPS 备份
 
 给 Grok Bot 用的 VPS 自动备份，本机留最新一份，夸克网盘留最近 3 份。
@@ -23,7 +25,7 @@
 ## 安装
 
 ```bash
-git clone <本仓库> grok-bot-vps-backup
+git clone https://github.com/icekale/grok-bot-vps-backup.git
 cd grok-bot-vps-backup
 ```
 
