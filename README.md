@@ -14,6 +14,7 @@
 - **进程内调度**：面板按每台机器的 `interval_hours` 自动备份；失败有退避。
 - **本机面板**：只监听 `127.0.0.1:8787`。本机访问可免 token；非本机请求需要 `?t=`。
 - **夸克 3 槽覆盖**：把每台机器最新 N 份（默认 3）以 `id-1.tgz` … `id-N.tgz` 上传到同一网盘目录，新的覆盖旧槽。
+- **完成通知**：Telegram、飞书/Lark 自定义机器人、通用 JSON webhook。备份、恢复、夸克上传结束后在后台发送，失败不影响备份。
 
 ## 依赖
 
@@ -71,13 +72,43 @@ export GROK_BACKUP_ROOT=/home/box/backups
 
 配置默认位置：`$HOME/.config/quark-backup/config.json`。
 
+## 通知
+
+面板左侧「通知」页（`#notify`）可开关事件、配置三个通道。配置写在 `$GROK_BACKUP_ROOT/notify.json`（权限 `600`，原子写入）。仓库里的 `notify.example.json` 是空密钥模板，不要把真实 token 或 webhook 提交进 Git。
+
+事件（默认全开，可单独关掉成功通知）：
+
+`backup.success` · `backup.failed` · `restore.success` · `restore.failed` · `quark.success` · `quark.failed`，以及测试用的 `notify.test`。
+
+- **Telegram**：`POST https://api.telegram.org/bot<token>/sendMessage`，正文为短中文。
+- **飞书 / Lark**：对自定义机器人 webhook `POST {"msg_type":"text","content":{"text":"..."}}`。
+- **通用 webhook**：`POST` `application/json`，`User-Agent: grok-bot-vps-backup`，`X-Webhook-Event: <event>`。若填写了签名密钥，另带 `X-Webhook-Signature: sha256=<hex>`，值为原始 body 的 HMAC-SHA256。
+
+```json
+{
+  "source": "grok-bot-vps-backup",
+  "event": "backup.success",
+  "ok": true,
+  "host_id": "example1",
+  "host_name": "example1",
+  "file": "example1-20260824-1500.tgz",
+  "duration_sec": 12.3,
+  "bytes": 1048576,
+  "message": "备份成功: example1 · example1-20260824-1500.tgz",
+  "error": null,
+  "timestamp": "2026-08-24T15:00:00+08:00"
+}
+```
+
+`event` 还可能是 `backup.failed`、`restore.success`、`restore.failed`、`quark.success`、`quark.failed`、`notify.test`。失败时 `ok` 为 `false`，`error` 为字符串。状态接口只回末四位密钥，不会回传 token 或带密钥的 URL。
+
 ## 安全说明
 
 - 恢复**默认不会覆盖**线上站点，只写到 `/opt/vps-restore/...`。要换回生产目录请自己确认后再动手。
 - 面板只绑 `127.0.0.1`。本机可跳过 token；不要把面板暴露到公网。
 - 主机 ID、备份文件名、恢复路径都有正则校验；恢复拒绝 `..` 和绝对路径成员。
 - `hosts.json` 原子写入；请求体有大小限制；远端 tar 参数经过 `shlex.quote`。
-- **不要提交** `hosts.json`、SSH 私钥、`ui/token`、备份包或日志。
+- **不要提交** `hosts.json`、`notify.json`、SSH 私钥、`ui/token`、备份包或日志。
 
 ## 目录约定
 
@@ -89,6 +120,7 @@ export GROK_BACKUP_ROOT=/home/box/backups
 | `$GROK_BACKUP_ROOT/hosts/<id>/` | 该机备份包 |
 | `$GROK_BACKUP_ROOT/ui/token` | 面板 token |
 | `$GROK_BACKUP_ROOT/quark/settings.json` | 夸克自动上传等偏好 |
+| `$GROK_BACKUP_ROOT/notify.json` | 通知通道（勿提交） |
 
 ## 许可
 
