@@ -1,0 +1,26 @@
+{
+  "hosts": [
+    {
+      "id": "example1",
+      "name": "example1",
+      "host": "203.0.113.10",
+      "port": 22,
+      "user": "root",
+      "key": "/home/you/.ssh/id_ed25519",
+      "paths": ["opt/app"],
+      "keep": 1,
+      "interval_hours": 24
+    },
+    {
+      "id": "example2",
+      "name": "example2",
+      "host": "203.0.113.20",
+      "port": 22,
+      "user": "root",
+      "key": "/home/you/.ssh/id_ed25519",
+      "paths": ["opt/app"],
+      "keep": 1,
+      "interval_hours": 24
+    }
+  ]
+}
