@@ -18,6 +18,10 @@ try:
     import bridge as quark_bridge
 except Exception:
     quark_bridge = None
+try:
+    import notify as notify_mod
+except Exception:
+    notify_mod = None
 
 ROOT = Path(os.environ.get("GROK_BACKUP_ROOT") or (Path.home() / ".local/share/grok-vps-backup"))
 HOSTS_FILE = ROOT / "hosts.json"
@@ -217,6 +221,42 @@ def ssh_probe(h, key_path=None):
     return True, msg
 
 
+def _notify_job(kind, hid, ok, error=None, pack=""):
+    if not notify_mod:
+        return
+    try:
+        notify_mod.emit_job(
+            kind,
+            get_host(hid) or {"id": hid, "name": hid},
+            ok,
+            job=read_job(hid),
+            last=read_last(hid),
+            error=error,
+            pack=pack,
+        )
+    except Exception:
+        pass
+
+
+def _notify_quark(result):
+    if not notify_mod:
+        return
+    try:
+        notify_mod.emit_quark(result)
+    except Exception:
+        pass
+
+
+def _quark_auto_upload():
+    result = {"ok": False, "message": "upload failed"}
+    try:
+        if quark_bridge:
+            result = quark_bridge.run_upload()
+    except Exception:
+        result = {"ok": False, "message": "upload failed"}
+    _notify_quark(result)
+
+
 def run_backup(hid):
     with _lock:
         if _running.get(hid):
@@ -225,6 +265,8 @@ def run_backup(hid):
         _errors[hid] = None
 
     def _job():
+        ok = False
+        err = None
         try:
             r = subprocess.run(
                 [str(CODE_DIR / "backup-one.sh"), hid],
@@ -233,16 +275,19 @@ def run_backup(hid):
             )
             if r.returncode != 0:
                 job = read_job(hid)
-                _errors[hid] = job.get("error") or (r.stderr or r.stdout or "备份失败")[-400]
+                err = job.get("error") or (r.stderr or r.stdout or "备份失败")[-400]
+                _errors[hid] = err
             else:
                 _errors[hid] = None
+                ok = True
                 try:
                     if quark_bridge and quark_bridge.load_settings().get("auto"):
-                        threading.Thread(target=quark_bridge.run_upload, daemon=True).start()
+                        threading.Thread(target=_quark_auto_upload, daemon=True).start()
                 except Exception:
                     pass
         except Exception as e:
-            _errors[hid] = str(e)
+            err = str(e)
+            _errors[hid] = err
             dest = dest_for(hid)
             try:
                 (dest / "job.json").write_text(json.dumps({
@@ -254,6 +299,7 @@ def run_backup(hid):
         finally:
             with _lock:
                 _running[hid] = False
+            _notify_job("backup", hid, ok, err)
 
     threading.Thread(target=_job, daemon=True).start()
     return True
@@ -288,6 +334,8 @@ def run_restore(hid, name):
         _errors[hid] = None
 
     def _job():
+        ok = False
+        err = None
         try:
             r = subprocess.run(
                 [str(CODE_DIR / "restore-one.sh"), hid, name],
@@ -296,11 +344,14 @@ def run_restore(hid, name):
             )
             if r.returncode != 0:
                 job = read_job(hid)
-                _errors[hid] = job.get("error") or (r.stderr or r.stdout or "恢复失败")[-400]
+                err = job.get("error") or (r.stderr or r.stdout or "恢复失败")[-400]
+                _errors[hid] = err
             else:
                 _errors[hid] = None
+                ok = True
         except Exception as e:
-            _errors[hid] = str(e)
+            err = str(e)
+            _errors[hid] = err
             try:
                 (dest_for(hid) / "job.json").write_text(json.dumps({
                     "phase": "failed", "message": "恢复失败", "bytes": 0,
@@ -311,6 +362,7 @@ def run_restore(hid, name):
         finally:
             with _lock:
                 _running[hid] = False
+            _notify_job("restore", hid, ok, err, pack=name)
 
     threading.Thread(target=_job, daemon=True).start()
     return True
@@ -470,6 +522,20 @@ HTML = r"""<!doctype html>
   .ov-card .top { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
   .ov-card .top b { font-size: 16px; }
   .ov-card .meta { color: var(--muted); font-size: 12px; line-height: 1.65; }
+  .chan {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 14px 16px; margin-bottom: 12px;
+  }
+  .chan h3 { margin: 0 0 4px; font-size: 15px; font-weight: 650; }
+  .chan .row { margin-top: 12px; }
+  .checks { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 8px 0 4px; }
+  .checks label, .toggle {
+    display: flex; align-items: center; gap: 8px; color: var(--text);
+    font-size: 13px; margin: 0;
+  }
+  .toggle { margin: 10px 0 4px; }
+  .checks input, .toggle input { width: auto; accent-color: var(--acc); }
+  .secret-hint { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
   @media (max-width: 860px) {
     .app { flex-direction: column; }
     aside { width: auto; border-right: 0; border-bottom: 1px solid var(--line); }
@@ -487,6 +553,7 @@ HTML = r"""<!doctype html>
     </div>
     <div class="hosts" id="hosts"></div>
     <a class="host" id="quarknav" href="#quark"><i class="dot"></i><div><b>夸克网盘</b><span>异地副本</span></div></a>
+    <a class="host" id="notifynav" href="#notify"><i class="dot"></i><div><b>通知</b><span>备份结果</span></div></a>
     <button class="add" id="add">添加 VPS</button>
     <div class="aside-foot" id="foot"></div>
   </aside>
@@ -571,7 +638,7 @@ HTML = r"""<!doctype html>
 </dialog>
 <script>
 const token = new URLSearchParams(location.search).get("t") || "";
-let selected = (location.hash === "#quark") ? "quark" : "overview";
+let selected = (location.hash === "#quark") ? "quark" : ((location.hash === "#notify") ? "notify" : "overview");
 let hosts = [];
 let paths = [];
 let mode = "add";
@@ -683,9 +750,11 @@ function renderChips(){
 
 function currentView(){
   if (location.hash === "#quark") return "quark";
+  if (location.hash === "#notify") return "notify";
   const id = location.hash.replace(/^#/, "");
   if (id && hosts.find(h => h.id === id)) return id;
   if (selected === "quark") return "quark";
+  if (selected === "notify") return "notify";
   if (selected && hosts.find(h => h.id === selected)) return selected;
   return "overview";
 }
@@ -721,6 +790,7 @@ function renderOverview(){
   const busy = hosts.some(h => h.running);
   const total = hosts.reduce((n,h) => n + (h.bytes||0), 0);
   document.getElementById("back").hidden = true;
+  run.hidden = false;
   document.getElementById("title").textContent = "总览";
   const nx = (hosts.map(x => x.next).filter(x => x && x.due)[0] || hosts.map(x => x.next).sort((a,b)=>(a&&a.at||"z").localeCompare(b&&b.at||"z"))[0] || {});
   document.getElementById("sub").textContent = "按各机频率自动备份" + (nx.label ? " · 下次 " + nx.label : "");
@@ -768,6 +838,11 @@ function goQuark(){
   setView("quark");
   render();
   loadQuark();
+}
+function goNotify(){
+  setView("notify");
+  render();
+  loadNotify();
 }
 async function loadQuark(){
   try {
@@ -855,6 +930,181 @@ function renderQuark(){
     loadQuark();
   };
 }
+async function loadNotify(){
+  try {
+    window._notify = await api("/api/notify/status");
+  } catch (e) {
+    window._notify = {events:{}, telegram:{bot_token:{}}, feishu:{webhook:{}}, webhook:{url:{}, secret:{}}, message:String(e)};
+  }
+  if (selected === "notify") renderNotify();
+}
+function evOn(n, key){
+  const ev = (n && n.events) || {};
+  return ev[key] !== false;
+}
+function last4(field){
+  if (!field || !field.configured) return "";
+  return field.last4 || "";
+}
+function secretHint(field, emptyText){
+  if (field && field.configured) return "已保存 · 末四位 " + esc(last4(field)) + "。留空再保存则不改。";
+  return emptyText || "";
+}
+function channelLabel(id){
+  return ({telegram:"Telegram", feishu:"飞书", webhook:"Webhook"})[id] || id;
+}
+function showNotifyResult(r){
+  const toast = document.getElementById("toast");
+  const bits = Object.keys((r && r.channels) || {}).map(k => {
+    const c = r.channels[k];
+    return channelLabel(k) + (c.ok ? " 成功" : (" 失败" + (c.error ? " · " + c.error : "")));
+  });
+  if (!bits.length) bits.push(r && r.message ? r.message : "没有启用的通道");
+  toast.textContent = bits.join("；");
+  toast.className = "toast" + (r && r.ok ? "" : " err");
+}
+function notifyEvents(){
+  return {
+    "backup.success": document.getElementById("ev-bs").checked,
+    "backup.failed": document.getElementById("ev-bf").checked,
+    "restore.success": document.getElementById("ev-rs").checked,
+    "restore.failed": document.getElementById("ev-rf").checked,
+    "quark.success": document.getElementById("ev-qs").checked,
+    "quark.failed": document.getElementById("ev-qf").checked
+  };
+}
+function renderNotify(){
+  const n = window._notify || {};
+  const tg = n.telegram || {};
+  const fs = n.feishu || {};
+  const wh = n.webhook || {};
+  const run = document.getElementById("run");
+  const rm = document.getElementById("remove");
+  const ed = document.getElementById("edit");
+  const list = document.getElementById("list");
+  const toast = document.getElementById("toast");
+  const badge = document.getElementById("badge");
+  const stats = document.getElementById("stats");
+  const job = document.getElementById("job");
+  const onCount = [tg.enabled, fs.enabled, wh.enabled].filter(Boolean).length;
+  document.getElementById("back").hidden = false;
+  document.getElementById("title").textContent = "通知";
+  document.getElementById("sub").textContent = "备份、恢复、夸克上传完成后推送。发送失败不影响备份。";
+  badge.hidden = false;
+  badge.className = "badge " + (onCount ? "ok" : "warn");
+  badge.textContent = onCount ? (onCount + " 个通道已启用") : "未启用";
+  document.getElementById("keeprow").hidden = true;
+  run.hidden = true; rm.hidden = true; ed.hidden = true;
+  toast.className = "toast";
+  toast.textContent = "";
+  stats.hidden = false;
+  stats.innerHTML = `
+    <div class="stat"><i>Telegram</i><b>${tg.enabled ? "开" : "关"}</b></div>
+    <div class="stat"><i>飞书</i><b>${fs.enabled ? "开" : "关"}</b></div>
+    <div class="stat"><i>Webhook</i><b>${wh.enabled ? "开" : "关"}</b></div>
+    <div class="stat"><i>成功通知</i><b>${evOn(n,"backup.success") && evOn(n,"restore.success") && evOn(n,"quark.success") ? "开" : "部分关闭"}</b></div>`;
+  job.hidden = true;
+  list.className = "";
+  list.innerHTML = `
+    <div class="chan">
+      <h3>事件</h3>
+      <p class="hint">失败建议保持开启；成功可按需关掉。</p>
+      <div class="checks">
+        <label><input type="checkbox" id="ev-bs" ${evOn(n,"backup.success") ? "checked" : ""}>备份成功</label>
+        <label><input type="checkbox" id="ev-bf" ${evOn(n,"backup.failed") ? "checked" : ""}>备份失败</label>
+        <label><input type="checkbox" id="ev-rs" ${evOn(n,"restore.success") ? "checked" : ""}>恢复成功</label>
+        <label><input type="checkbox" id="ev-rf" ${evOn(n,"restore.failed") ? "checked" : ""}>恢复失败</label>
+        <label><input type="checkbox" id="ev-qs" ${evOn(n,"quark.success") ? "checked" : ""}>夸克成功</label>
+        <label><input type="checkbox" id="ev-qf" ${evOn(n,"quark.failed") ? "checked" : ""}>夸克失败</label>
+      </div>
+    </div>
+    <div class="chan">
+      <h3>Telegram</h3>
+      <p class="hint">用 BotFather 建机器人，把 Bot Token 和 chat_id 填这里。</p>
+      <label class="toggle"><input type="checkbox" id="tg-on" ${tg.enabled ? "checked" : ""}>启用</label>
+      <label>Bot Token</label>
+      <input id="tg-token" type="password" autocomplete="off" placeholder="${tg.bot_token && tg.bot_token.configured ? "已保存 ·••••" + esc(last4(tg.bot_token)) : "123456:ABC…"}">
+      <p class="secret-hint">${secretHint(tg.bot_token, "不会在页面或接口里回传完整 token。")}</p>
+      <label>Chat ID</label>
+      <input id="tg-chat" value="${esc(tg.chat_id || "")}" placeholder="123456789">
+      <div class="row">
+        <button type="button" class="primary" id="tg-save">保存</button>
+        <button type="button" id="tg-test">发送测试</button>
+      </div>
+    </div>
+    <div class="chan">
+      <h3>飞书 / Lark</h3>
+      <p class="hint">群里添加自定义机器人，粘贴 webhook 地址。</p>
+      <label class="toggle"><input type="checkbox" id="fs-on" ${fs.enabled ? "checked" : ""}>启用</label>
+      <label>Webhook</label>
+      <input id="fs-hook" type="password" autocomplete="off" placeholder="${fs.webhook && fs.webhook.configured ? "已保存 ·••••" + esc(last4(fs.webhook)) : "https://open.feishu.cn/open-apis/bot/v2/hook/…"}">
+      <p class="secret-hint">${secretHint(fs.webhook, "地址里带密钥，保存后只显示末四位。")}</p>
+      <div class="row">
+        <button type="button" class="primary" id="fs-save">保存</button>
+        <button type="button" id="fs-test">发送测试</button>
+      </div>
+    </div>
+    <div class="chan">
+      <h3>通用 Webhook</h3>
+      <p class="hint">POST JSON，可选 HMAC-SHA256 签名。事件名见 README。</p>
+      <label class="toggle"><input type="checkbox" id="wh-on" ${wh.enabled ? "checked" : ""}>启用</label>
+      <label>URL</label>
+      <input id="wh-url" type="password" autocomplete="off" placeholder="${wh.url && wh.url.configured ? "已保存 ·••••" + esc(last4(wh.url)) : "https://example.com/hook"}">
+      <p class="secret-hint">${secretHint(wh.url, "完整 URL 不会出现在状态接口里。")}</p>
+      <label>签名密钥（可选）</label>
+      <input id="wh-secret" type="password" autocomplete="off" placeholder="${wh.secret && wh.secret.configured ? "已保存 ·••••" + esc(last4(wh.secret)) : "留空则不签名"}">
+      <p class="secret-hint">${secretHint(wh.secret, "若填写，请求头会带 X-Webhook-Signature: sha256=…")}</p>
+      <div class="row">
+        <button type="button" class="primary" id="wh-save">保存</button>
+        <button type="button" id="wh-test">发送测试</button>
+      </div>
+    </div>`;
+  document.querySelectorAll(".checks input").forEach(el => {
+    el.onchange = async () => {
+      try {
+        window._notify = await api("/api/notify/setup", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({events: notifyEvents()})});
+      } catch (e) {
+        document.getElementById("toast").textContent = String(e.message || e);
+        document.getElementById("toast").className = "toast err";
+      }
+    };
+  });
+  const saveChan = async (label, payload) => {
+    try {
+      window._notify = await api("/api/notify/setup", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+      renderNotify();
+      document.getElementById("toast").textContent = label + " 已保存";
+      document.getElementById("toast").className = "toast";
+    } catch (e) {
+      document.getElementById("toast").textContent = String(e.message || e);
+      document.getElementById("toast").className = "toast err";
+    }
+  };
+  document.getElementById("tg-save").onclick = () => saveChan("Telegram", {
+    events: notifyEvents(),
+    telegram: {enabled: document.getElementById("tg-on").checked, bot_token: document.getElementById("tg-token").value.trim(), chat_id: document.getElementById("tg-chat").value.trim()}
+  });
+  document.getElementById("fs-save").onclick = () => saveChan("飞书", {
+    events: notifyEvents(),
+    feishu: {enabled: document.getElementById("fs-on").checked, webhook: document.getElementById("fs-hook").value.trim()}
+  });
+  document.getElementById("wh-save").onclick = () => saveChan("Webhook", {
+    events: notifyEvents(),
+    webhook: {enabled: document.getElementById("wh-on").checked, url: document.getElementById("wh-url").value.trim(), secret: document.getElementById("wh-secret").value.trim()}
+  });
+  const testCh = async (channel) => {
+    try {
+      const r = await api("/api/notify/test", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({channel})});
+      showNotifyResult(r);
+    } catch (e) {
+      document.getElementById("toast").textContent = String(e.message || e);
+      document.getElementById("toast").className = "toast err";
+    }
+  };
+  document.getElementById("tg-test").onclick = () => testCh("telegram");
+  document.getElementById("fs-test").onclick = () => testCh("feishu");
+  document.getElementById("wh-test").onclick = () => testCh("webhook");
+}
 function render(data){
   renderAlerts(data || {disk: window._disk, hosts});
   if (data && data.disk) window._disk = data.disk;
@@ -862,6 +1112,8 @@ function render(data){
   document.getElementById("brand").className = "brand" + (selected === "overview" ? " on" : "");
   const qn = document.getElementById("quarknav");
   if (qn) qn.className = "host" + (selected === "quark" ? " active" : "");
+  const nn = document.getElementById("notifynav");
+  if (nn) nn.className = "host" + (selected === "notify" ? " active" : "");
   box.innerHTML = hosts.map(h => {
     const st = statusOf(h);
     const sub = h.running ? "正在备份" : (h.last ? rel(h.last) : "还没有备份");
@@ -872,6 +1124,7 @@ function render(data){
   }).join("");
   box.querySelectorAll(".host").forEach(el => el.onclick = () => { setView(el.dataset.id); render(data); });
   if (qn) qn.onclick = (e) => { e.preventDefault(); goQuark(); };
+  if (nn) nn.onclick = (e) => { e.preventDefault(); goNotify(); };
   const total = hosts.reduce((n,h) => n + (h.bytes||0), 0);
   const disk = (data && data.disk) || window._disk;
   document.getElementById("foot").textContent =
@@ -883,6 +1136,10 @@ function render(data){
   }
   if (selected === "quark"){
     renderQuark();
+    return;
+  }
+  if (selected === "notify"){
+    renderNotify();
     return;
   }
   const h = hosts.find(x => x.id === selected);
@@ -899,6 +1156,7 @@ function render(data){
     document.getElementById("title").textContent = "选择一台机器";
     document.getElementById("sub").textContent = "按设置的频率自动备份";
     badge.hidden = true;
+    run.hidden = false;
     run.disabled = true; rm.disabled = true; ed.disabled = true;
     document.getElementById("keeprow").hidden = true;
     stats.hidden = true; job.hidden = true;
@@ -916,6 +1174,7 @@ function render(data){
   badge.className = "badge " + st.key;
   badge.textContent = st.label;
   document.getElementById("keeprow").hidden = false;
+  run.hidden = false;
   const keepEl = document.getElementById("keep");
   if (document.activeElement !== keepEl) keepEl.value = h.keep;
   run.disabled = !!h.running;
@@ -989,7 +1248,7 @@ function render(data){
 function saveKeep(n){
   n = Math.max(1, Math.min(30, Number(n || 7)));
   document.getElementById("keep").value = n;
-  if (!selected || selected === "overview") return;
+  if (!selected || selected === "overview" || selected === "quark" || selected === "notify") return;
   clearTimeout(keepTimer);
   keepTimer = setTimeout(async () => {
     await api("/api/hosts/keep?id=" + encodeURIComponent(selected) + "&keep=" + encodeURIComponent(n), {method:"POST"});
@@ -1042,6 +1301,8 @@ document.getElementById("run").onclick = async () => {
   if (!selected) return;
   if (selected === "overview") {
     await api("/api/backup-all", {method:"POST"});
+  } else if (selected === "notify") {
+    return;
   } else if (selected === "quark") {
     const r = await api("/api/quark/run", {method:"POST"});
     document.getElementById("toast").textContent = r.ok ? "上传完成" : (r.message || "上传失败");
@@ -1072,6 +1333,7 @@ document.getElementById("remove").onclick = async () => {
 document.getElementById("brand").onclick = goOverview;
 document.getElementById("back").onclick = goOverview;
 document.getElementById("quarknav").onclick = goQuark;
+document.getElementById("notifynav").onclick = goNotify;
 document.getElementById("add").onclick = () => openDlg("add");
 document.getElementById("testbtn").onclick = async () => {
   const f = document.getElementById("form");
@@ -1132,11 +1394,12 @@ window.addEventListener("hashchange", () => {
   selected = currentView();
   render();
   if (selected === "quark") loadQuark();
+  if (selected === "notify") loadNotify();
 });
 load();
 setInterval(() => {
   if (document.querySelector("dialog[open]")) return;
-  if (selected === "quark") return;
+  if (selected === "quark" || selected === "notify") return;
   load();
 }, 2500);
 </script>
@@ -1291,6 +1554,12 @@ class Handler(BaseHTTPRequestHandler):
             if not quark_bridge:
                 return self._json({"logged_in": False, "message": "夸克组件未装好"})
             return self._json(quark_bridge.status())
+        if u.path == "/api/notify/status":
+            if not check_token(qs, self):
+                return self._deny()
+            if not notify_mod:
+                return self._deny(500, "no notify")
+            return self._json(notify_mod.public_status())
         self._deny(404, "not found")
 
     def do_POST(self):
@@ -1407,7 +1676,29 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/quark/run":
             if not quark_bridge:
                 return self._deny(500, "no quark")
-            return self._json(quark_bridge.run_upload())
+            result = quark_bridge.run_upload()
+            _notify_quark(result)
+            return self._json(result)
+        if u.path == "/api/notify/setup":
+            if not notify_mod:
+                return self._deny(500, "no notify")
+            try:
+                body = read_body(self)
+            except BodyTooLarge:
+                return self._deny(413, "payload too large")
+            except Exception:
+                return self._deny(400, "bad json")
+            return self._json(notify_mod.setup(body))
+        if u.path == "/api/notify/test":
+            if not notify_mod:
+                return self._deny(500, "no notify")
+            try:
+                body = read_body(self)
+            except BodyTooLarge:
+                return self._deny(413, "payload too large")
+            except Exception:
+                body = {}
+            return self._json(notify_mod.test(body))
         if u.path == "/api/backup-all":
             for h in load_hosts()["hosts"]:
                 hid = h.get("id") or ""

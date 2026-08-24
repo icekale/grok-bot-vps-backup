@@ -1,5 +1,6 @@
 hosts.json
 hosts/
+notify.json
 ui/token
 ui/*.log
 ui/watchdog.pid
