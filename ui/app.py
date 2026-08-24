@@ -773,6 +773,7 @@ async function load(){
   window._disk = data.disk;
   selected = currentView();
   render(data);
+  if (selected === "notify") loadNotify();
 }
 
 function renderOverview(){

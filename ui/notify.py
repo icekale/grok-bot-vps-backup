@@ -262,7 +262,7 @@ def _webhook_payload(event, ctx):
         "host_id": _clip(ctx.get("host_id"), 64),
         "host_name": _clip(ctx.get("host_name"), 80),
         "file": _clip(ctx.get("file"), 200),
-        "duration_sec": _num(ctx.get("duration_sec")),
+        "duration_sec": _qty(ctx.get("duration_sec")),
         "bytes": int(_num(ctx.get("bytes"))),
         "message": _clip(ctx.get("message") or _zh_text(event, ctx), 300),
         "error": err,
@@ -278,6 +278,12 @@ def _num(v):
     if n < 0:
         return 0
     return n
+
+
+def _qty(v):
+    n = _num(v)
+    r = round(n)
+    return int(r) if abs(n - r) < 1e-9 else n
 
 
 def _send_webhook(cfg, payload):
