@@ -1,24 +1,26 @@
-# grok-bot-vps-backup
+# GrokKeep
 
 [English](README.en.md) · [中文](README.md)
 
-Local VPS backup panel. Streams remote directories over SSH into `tar.gz`, keeps N copies per host on this machine, optionally rotates N slots on Quark Drive, and can notify via Telegram, Feishu/Lark, or a JSON webhook.
+GrokKeep is a local VPS backup panel for Grok-related hosts: it streams remote directories over SSH into `tar.gz`, keeps N copies per host on this machine, and can optionally copy them to Quark Drive.
 
-Data root: `GROK_BACKUP_ROOT` (default `~/.local/share/grok-vps-backup`). Panel default: `127.0.0.1:8787`.
+After backup, restore, or upload it can notify via Telegram, Feishu/Lark, or a JSON webhook. Data root: `GROK_BACKUP_ROOT` (default `~/.local/share/grok-vps-backup`). Panel default: `127.0.0.1:8787`.
 
 ## Install and run
 
 Needs Linux, `python3`, `ssh`, `tar`. Quark upload also needs `node` and the official `quarkclouddrive` CLI (`quark/install-quark.sh`).
 
 ```bash
-git clone https://github.com/icekale/grok-bot-vps-backup.git
-cd grok-bot-vps-backup
+git clone https://github.com/icekale/grokkeep.git
+cd grokkeep
 
 export GROK_BACKUP_ROOT="${GROK_BACKUP_ROOT:-$HOME/.local/share/grok-vps-backup}"
 mkdir -p "$GROK_BACKUP_ROOT"
 cp hosts.example.json "$GROK_BACKUP_ROOT/hosts.json"
 # edit host, user, and an absolute key path, e.g. $HOME/.ssh/id_ed25519
 ```
+
+The previous slug `icekale/grok-bot-vps-backup` redirects to `icekale/grokkeep`. The `GROK_BACKUP_ROOT` env var and default data directory are unchanged.
 
 ```bash
 ./ui/start.sh

@@ -1,24 +1,26 @@
 [English](README.en.md) · 中文
 
-# grok-bot-vps-backup
+# GrokKeep
 
-本机 VPS 备份面板。经 SSH 把远端目录流式打成 `tar.gz`，本机按各机保留份数，可选再传到夸克网盘（每台 N 个槽位覆盖），备份/恢复/上传完成后可推 Telegram、飞书或 webhook。
+GrokKeep 是面向 Grok 相关主机的本机 VPS 备份面板：经 SSH 把远端目录流式打成 `tar.gz`，本机按各机保留份数，可选再传到夸克网盘。
 
-数据根：`GROK_BACKUP_ROOT`（默认 `~/.local/share/grok-vps-backup`）。面板默认 `127.0.0.1:8787`。
+备份/恢复/上传完成后可推 Telegram、飞书或 webhook。数据根：`GROK_BACKUP_ROOT`（默认 `~/.local/share/grok-vps-backup`）。面板默认 `127.0.0.1:8787`。
 
 ## 安装与运行
 
 依赖：Linux、`python3`、`ssh`、`tar`。夸克上传另外需要 `node` 和官方 `quarkclouddrive` CLI（见 `quark/install-quark.sh`）。
 
 ```bash
-git clone https://github.com/icekale/grok-bot-vps-backup.git
-cd grok-bot-vps-backup
+git clone https://github.com/icekale/grokkeep.git
+cd grokkeep
 
 export GROK_BACKUP_ROOT="${GROK_BACKUP_ROOT:-$HOME/.local/share/grok-vps-backup}"
 mkdir -p "$GROK_BACKUP_ROOT"
 cp hosts.example.json "$GROK_BACKUP_ROOT/hosts.json"
 # 改地址、用户、密钥绝对路径，例如 $HOME/.ssh/id_ed25519
 ```
+
+旧仓库名 `icekale/grok-bot-vps-backup` 会重定向到 `icekale/grokkeep`。环境变量 `GROK_BACKUP_ROOT` 与默认数据目录不变。
 
 ```bash
 ./ui/start.sh
