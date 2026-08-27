@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+### 中文
+
+- 产品更名为 **GrokKeep**。面板 `<title>` 与侧栏标题改为 GrokKeep；仓库说明与文档同步。
+- `GROK_BACKUP_ROOT`、默认数据目录、webhook `User-Agent` 保持兼容，不做破坏性改名。
+
+### English
+
+- Renamed the product to **GrokKeep**. Panel `<title>` and sidebar heading are GrokKeep; repo description and docs match.
+- `GROK_BACKUP_ROOT`, the default data directory, and the webhook `User-Agent` stay compatible. No breaking path rename.
+
 ## 0.2.0
 
 ### 中文

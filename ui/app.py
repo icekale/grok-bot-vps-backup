@@ -552,7 +552,7 @@ HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VPS 备份</title>
+<title>GrokKeep</title>
 <style>
   :root {
     --bg:#0b0b0f; --panel:#121218; --card:#1a1a22; --line:#2a2a34;
@@ -726,7 +726,7 @@ HTML = r"""<!doctype html>
 <div class="app">
   <aside>
     <div class="brand on" id="brand">
-      <h1>VPS 备份</h1>
+      <h1>GrokKeep</h1>
       <p>按各机频率自动备份</p>
     </div>
     <div class="hosts" id="hosts"></div>

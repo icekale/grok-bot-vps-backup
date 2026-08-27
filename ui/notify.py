@@ -389,7 +389,7 @@ def _line(verb, ctx, tails):
 
 def _zh_text(event, ctx):
     if event == "notify.test":
-        return "通知测试：VPS 备份"
+        return "通知测试：GrokKeep"
     err = _clip(ctx.get("error"), 80)
     if event == "backup.success":
         return _line("备份成功", ctx, [_fmt_dur(ctx.get("duration_sec")), _fmt_size(ctx.get("bytes"))])
