@@ -1,62 +1,33 @@
-# Grok Bot VPS Backup
+# grok-bot-vps-backup
 
 [English](README.en.md) · [中文](README.md)
 
-Automatic VPS backups for Grok Bot. Keep the latest copy on this machine, and the last 3 copies on Quark Drive.
+Local VPS backup panel. Streams remote directories over SSH into `tar.gz`, keeps N copies per host on this machine, optionally rotates N slots on Quark Drive, and can notify via Telegram, Feishu/Lark, or a JSON webhook.
 
-It streams remote directories over SSH into a tar.gz, checks the archive, then stores it locally. A small panel schedules each host on its own interval. Optionally it uploads to Quark Drive and keeps only the newest 3 slots per machine, overwriting the oldest.
+Data root: `GROK_BACKUP_ROOT` (default `~/.local/share/grok-vps-backup`). Panel default: `127.0.0.1:8787`.
 
-## Features
+## Install and run
 
-- **Streamed SSH packs**: remote `tar` writes straight to this machine. No temp archive on the VPS.
-- **Integrity check**: `tar -tzf` after download; a bad pack is discarded.
-- **Safe restore**: unpacks to `/opt/vps-restore/<id>/<timestamp>` on the remote by default. It does not overwrite the live site.
-- **In-process scheduler**: the panel runs each host on `interval_hours`, with backoff on failure.
-- **Local panel**: binds `127.0.0.1:8787` only. Loopback can skip the token; other clients need `?t=`.
-- **Quark 3-slot rotate**: uploads the newest N packs (default 3) as `id-1.tgz` … `id-N.tgz` in one Drive folder. Newer uploads overwrite the oldest slot.
-- **Completion notify**: Telegram, Feishu/Lark custom bot, and a generic JSON webhook. Fired after backup, restore, and Quark upload in a background thread. A notify failure never fails the job.
-
-## Requirements
-
-- Linux
-- `python3`
-- `ssh`, `tar`
-- Quark CLI also needs `node` (and the official `quarkclouddrive` skill)
-
-## Install
+Needs Linux, `python3`, `ssh`, `tar`. Quark upload also needs `node` and the official `quarkclouddrive` CLI (`quark/install-quark.sh`).
 
 ```bash
 git clone https://github.com/icekale/grok-bot-vps-backup.git
 cd grok-bot-vps-backup
-```
 
-Data directory (default):
-
-```bash
 export GROK_BACKUP_ROOT="${GROK_BACKUP_ROOT:-$HOME/.local/share/grok-vps-backup}"
 mkdir -p "$GROK_BACKUP_ROOT"
 cp hosts.example.json "$GROK_BACKUP_ROOT/hosts.json"
-# edit IPs, users, and key paths (use an absolute path, e.g. $HOME/.ssh/id_ed25519)
+# edit host, user, and an absolute key path, e.g. $HOME/.ssh/id_ed25519
 ```
-
-If you already run this on a Grok Bot machine, you can point the data root at the existing directory (optional):
-
-```bash
-export GROK_BACKUP_ROOT=/home/box/backups
-```
-
-Key path examples: `$HOME/.ssh/id_ed25519` or `/path/to/key.pem`. Never commit private keys.
-
-Start the panel and watchdog:
 
 ```bash
 ./ui/start.sh
 ./ui/watchdog.sh &
 ```
 
-Open `http://127.0.0.1:8787`. On first start, if no token exists, one is written to `$GROK_BACKUP_ROOT/ui/token` (mode `600`). For non-local access, append `?t=<token>`. Do not log the token or commit it.
+If `ssh` is missing, `start.sh` tries a noninteractive `openssh-client` install. An apt failure does not stop the panel. The watchdog is a loop that calls `start.sh`.
 
-You can also run by hand:
+Open `http://127.0.0.1:8787`. Or run by hand:
 
 ```bash
 ./backup-all.sh
@@ -64,67 +35,50 @@ You can also run by hand:
 ./restore-one.sh example1 example1-20260824-1500.tgz
 ```
 
-## Quark Drive
+Restore writes to `/opt/vps-restore/<id>/<timestamp>` on the remote by default. It does not overwrite the live site.
 
-1. Install the user-space deps for official [LYISTR2/quark-backup](https://github.com/LYISTR2/quark-backup) (see `quark/install-quark.sh`), or make sure `node` is present and the bundled `quark/quark-backup.sh` can find the official CLI.
-2. Sign in (get an auth URL from the panel's Quark page and paste the code, or run `./quark/run.sh login`).
-3. On the Quark page, set the Drive folder and whether to auto-upload. Cloud retention defaults to 3 copies per machine.
+## Access
 
-Config default: `$HOME/.config/quark-backup/config.json`.
+| Client | Token |
+| --- | --- |
+| `127.0.0.1` / `::1` | not required |
+| Tailscale CGNAT / ULA (only if enabled in Settings) | not required (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) |
+| anything else | `?t=` from `$GROK_BACKUP_ROOT/ui/token` (mode `600`) |
+
+The Tailscale flag lives in `$GROK_BACKUP_ROOT/access.json` and defaults to `false`. When on, the panel also binds the IPv4 on `tailscale0` (`ip -4 addr show tailscale0`) and tries MagicDNS from `tailscale status --json`. When off, it binds `127.0.0.1` only and does not trust those ranges. It never binds `0.0.0.0`. Do not publish the panel on the internet.
+
+## Quark
+
+Settings: login, remote folder, auto-upload, run now. Default is 3 slots per host (`id-1.tgz` … `id-N.tgz`; newer uploads overwrite the oldest slot).
+
+Uploads are single-flight: a second auto-upload is a no-op while one is running, and staging is not cleared mid-upload. The timeout is hours, not minutes. CLI config default: `$HOME/.config/quark-backup/config.json`.
 
 ## Notifications
 
-The panel's **通知** page (`#notify`) toggles events and the three channels. Config is `$GROK_BACKUP_ROOT/notify.json` (mode `600`, atomic write). `notify.example.json` in the repo is an empty-secret template. Do not commit real tokens or webhook URLs.
+Settings toggles events and the three channels. Config: `$GROK_BACKUP_ROOT/notify.json` (mode `600`). `notify.example.json` is an empty template.
 
-Events (all on by default; you can turn successes off):
+Events: `backup.success` / `backup.failed` / `restore.success` / `restore.failed` / `quark.success` / `quark.failed`, plus `notify.test`. A notify failure never fails the job.
 
-`backup.success` · `backup.failed` · `restore.success` · `restore.failed` · `quark.success` · `quark.failed`, plus `notify.test` for the test button.
+- Telegram: `POST https://api.telegram.org/bot<token>/sendMessage`
+- Feishu/Lark: custom-bot webhook, `{"msg_type":"text","content":{"text":"..."}}`
+- Webhook: `POST application/json`, `User-Agent: grok-bot-vps-backup`, `X-Webhook-Event`. Optional `X-Webhook-Signature: sha256=<hex>` (HMAC-SHA256 of the body)
 
-- **Telegram**: `POST https://api.telegram.org/bot<token>/sendMessage` with a short Chinese one-liner.
-- **Feishu / Lark**: POST `{"msg_type":"text","content":{"text":"..."}}` to the custom-bot webhook.
-- **Generic webhook**: `POST` `application/json` with `User-Agent: grok-bot-vps-backup` and `X-Webhook-Event: <event>`. If a signing secret is set, also `X-Webhook-Signature: sha256=<hex>` (HMAC-SHA256 of the raw body).
+Telegram/Feishu time is the backup's Shanghai time (`when` in `last.json`, or `YYYYMMDD-HHMM` in the pack name), not the send clock. The status API returns only the last four characters of secrets.
 
-Telegram / Feishu time is the backup or restore's Shanghai local time (`when` in `last.json`, or `YYYYMMDD-HHMM` from the pack name), not the send clock. Examples: `备份成功 example1 8/24 15:21  5s  44MB`, `备份失败 example2 8/24 15:21  ssh timeout`.
-
-```json
-{
-  "source": "grok-bot-vps-backup",
-  "event": "backup.success",
-  "ok": true,
-  "host_id": "example1",
-  "host_name": "example1",
-  "file": "example1-20260824-1521.tgz",
-  "duration_sec": 5,
-  "bytes": 46137344,
-  "message": "备份成功 example1 8/24 15:21  5s  44MB",
-  "error": null,
-  "when": "8/24 15:21",
-  "timestamp": "2026-08-24T15:21:08+08:00"
-}
-```
-
-`event` may also be `backup.failed`, `restore.success`, `restore.failed`, `quark.success`, `quark.failed`, or `notify.test`. Failures set `ok` to `false` and `error` to a string. `when` is the backup/restore Shanghai short time (e.g. `8/24 15:21`); `timestamp` is when the notify was sent. The status API returns only the last 4 characters of secrets, never the full token or webhook URL.
-
-## Safety
-
-- Restore **does not overwrite** the live site by default. It only writes `/opt/vps-restore/...`. Move files back to production yourself after you check them.
-- The panel binds `127.0.0.1` only. Loopback may skip the token. Do not expose the panel to the internet.
-- Host IDs, pack names, and restore paths are validated. Restore rejects `..` and absolute-path members.
-- `hosts.json` is written atomically. Request bodies are size-capped. Remote tar arguments are `shlex.quote`d.
-- **Do not commit** `hosts.json`, `notify.json`, SSH private keys, `ui/token`, backup packs, or logs.
+Old `#quark` and `#notify` hashes redirect to `#settings`.
 
 ## Layout
 
 | Path | Meaning |
 | --- | --- |
-| This repo | Scripts and panel code |
-| `$GROK_BACKUP_ROOT` | Data root (default `$HOME/.local/share/grok-vps-backup`) |
-| `$GROK_BACKUP_ROOT/hosts.json` | Host list |
-| `$GROK_BACKUP_ROOT/hosts/<id>/` | Packs for that host |
-| `$GROK_BACKUP_ROOT/ui/token` | Panel token |
-| `$GROK_BACKUP_ROOT/quark/settings.json` | Quark auto-upload preferences |
-| `$GROK_BACKUP_ROOT/notify.json` | Notify channels (do not commit) |
+| this repo | scripts and panel |
+| `$GROK_BACKUP_ROOT/hosts.json` | host list |
+| `$GROK_BACKUP_ROOT/hosts/<id>/` | packs for that host |
+| `$GROK_BACKUP_ROOT/ui/token` | panel token |
+| `$GROK_BACKUP_ROOT/access.json` | Tailscale flag |
+| `$GROK_BACKUP_ROOT/quark/settings.json` | Quark auto-upload prefs |
+| `$GROK_BACKUP_ROOT/notify.json` | notify channels |
 
-## License
+Do not commit `hosts.json`, `access.json`, `notify.json`, private keys, the token, packs, or logs.
 
 MIT. See [LICENSE](LICENSE).

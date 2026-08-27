@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
+import ipaddress
 import json
 import os
 import re
 import secrets
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
-import sys
 
 CODE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(CODE_DIR / "quark"))
@@ -25,31 +27,65 @@ except Exception:
 
 ROOT = Path(os.environ.get("GROK_BACKUP_ROOT") or (Path.home() / ".local/share/grok-vps-backup"))
 HOSTS_FILE = ROOT / "hosts.json"
-
-
-def ensure_token():
-    token_path = ROOT / "ui" / "token"
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    if token_path.exists():
-        tok = token_path.read_text().strip()
-        if tok:
-            return tok
-    tok = secrets.token_urlsafe(16)
-    token_path.write_text(tok + "\n")
-    token_path.chmod(0o600)
-    return tok
-
-
-TOKEN = ensure_token()
+ACCESS_FILE = ROOT / "access.json"
 PORT = 8787
 TZ = timezone(timedelta(hours=8))
 ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")
 FILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}-\d{8}-\d{4}\.tgz$")
 PATH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
+USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$")
+JOB_TIMEOUT = 4 * 3600
+TS_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+TS_ULA = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 _lock = threading.Lock()
 _running = {}
 _errors = {}
+_ts_httpd = None
+_ts_bind_ip = None
+_ts_lock = threading.Lock()
+
+
+def _chmod(path, mode):
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _atomic_write(path, text, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    _chmod(path, mode)
+
+
+def ensure_root():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    _chmod(ROOT, 0o700)
+
+
+def ensure_token():
+    ensure_root()
+    token_path = ROOT / "ui" / "token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    _chmod(token_path.parent, 0o700)
+    if token_path.exists():
+        tok = token_path.read_text().strip()
+        if tok:
+            _chmod(token_path, 0o600)
+            return tok
+    tok = secrets.token_urlsafe(16)
+    _atomic_write(token_path, tok + "\n")
+    return tok
+
+
+TOKEN = ensure_token()
 
 
 def load_hosts():
@@ -59,13 +95,7 @@ def load_hosts():
 
 
 def save_hosts(data):
-    tmp = ROOT / "hosts.json.tmp"
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    os.replace(tmp, HOSTS_FILE)
-    try:
-        HOSTS_FILE.chmod(0o600)
-    except Exception:
-        pass
+    _atomic_write(HOSTS_FILE, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 def get_host(hid):
@@ -80,7 +110,148 @@ def dest_for(hid):
     if not p.is_relative_to(root_hosts) or p == root_hosts:
         raise ValueError("bad dest")
     p.mkdir(parents=True, exist_ok=True)
+    _chmod(p, 0o700)
     return p
+
+
+def pack_path(hid, name):
+    if not ID_RE.match(hid) or not FILE_RE.match(name) or not name.startswith(hid + "-"):
+        return None
+    dest = dest_for(hid).resolve()
+    p = (dest / name).resolve()
+    if not p.is_file() or not p.is_relative_to(dest):
+        return None
+    return p
+
+
+def load_access():
+    if not ACCESS_FILE.exists():
+        return {"tailscale": False}
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        return {"tailscale": False}
+    return {"tailscale": bool(data.get("tailscale"))}
+
+
+def save_access(data):
+    out = {"tailscale": bool((data or {}).get("tailscale"))}
+    _atomic_write(ACCESS_FILE, json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+    return out
+
+
+def _client_ip(handler):
+    raw = (handler.client_address or [""])[0]
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+def tailscale_addrs():
+    ip, dns = None, None
+    try:
+        r = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "dev", "tailscale0"],
+            capture_output=True, text=True, timeout=3,
+        )
+        m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)", r.stdout or "")
+        if m:
+            cand = ipaddress.ip_address(m.group(1))
+            if cand.version == 4 and cand != ipaddress.ip_address("0.0.0.0"):
+                ip = str(cand)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        data = json.loads(r.stdout or "{}")
+        self = data.get("Self") or {}
+        name = (self.get("DNSName") or "").strip().rstrip(".")
+        if name and "://" not in name and "/" not in name:
+            dns = name
+        if not ip:
+            for item in self.get("TailscaleIPs") or []:
+                try:
+                    cand = ipaddress.ip_address(item)
+                except ValueError:
+                    continue
+                if cand.version == 4 and cand != ipaddress.ip_address("0.0.0.0"):
+                    ip = str(cand)
+                    break
+    except Exception:
+        pass
+    return ip, dns
+
+
+def _stop_ts_server():
+    global _ts_httpd, _ts_bind_ip
+    srv = _ts_httpd
+    _ts_httpd = None
+    _ts_bind_ip = None
+    if srv:
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+
+def sync_tailscale_bind():
+    global _ts_httpd, _ts_bind_ip
+    want = load_access().get("tailscale")
+    ip, _dns = tailscale_addrs()
+    with _ts_lock:
+        if not want or not ip:
+            _stop_ts_server()
+            return
+        if _ts_httpd and _ts_bind_ip == ip:
+            return
+        _stop_ts_server()
+        try:
+            srv = ThreadingHTTPServer((ip, PORT), Handler)
+        except OSError:
+            return
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        _ts_httpd = srv
+        _ts_bind_ip = ip
+
+
+def access_public():
+    sync_tailscale_bind()
+    acc = load_access()
+    ip, dns = tailscale_addrs()
+    urls = ["http://127.0.0.1:%s" % PORT]
+    if acc.get("tailscale") and ip:
+        urls.append("http://%s:%s" % (ip, PORT))
+        if dns:
+            urls.append("http://%s:%s" % (dns, PORT))
+    msg = ""
+    if acc.get("tailscale") and not ip:
+        msg = "未检测到 tailscale0 IPv4"
+    elif acc.get("tailscale") and ip and _ts_bind_ip != ip:
+        msg = "未能监听 Tailscale 地址，仍只绑 127.0.0.1"
+    return {
+        "tailscale": bool(acc.get("tailscale")),
+        "ip": ip or "",
+        "dns": dns or "",
+        "listening": bool(_ts_bind_ip),
+        "bind": ["127.0.0.1"] + ([_ts_bind_ip] if _ts_bind_ip else []),
+        "urls": urls,
+        "message": msg,
+    }
+
+
+def trusted_client(handler):
+    ip = _client_ip(handler)
+    if ip is None:
+        return False
+    if ip.is_loopback:
+        return True
+    if not load_access().get("tailscale"):
+        return False
+    return ip in TS_CGNAT or ip in TS_ULA
 
 
 def list_items(hid):
@@ -203,11 +374,15 @@ def read_job(hid):
 
 
 def ssh_probe(h, key_path=None):
+    user = str(h.get("user") or "root")
+    host = str(h.get("host") or "")
+    if not USER_RE.match(user) or not HOST_RE.match(host):
+        return False, "地址或用户无效"
     key = key_path or h["key"]
     cmd = [
         "ssh", "-i", str(key), "-p", str(h.get("port") or 22),
         "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=8",
-        f"{h['user']}@{h['host']}",
+        f"{user}@{host}",
         "printf '%s\\t%s' \"$(hostname)\" \"$(df -h / | awk 'NR==2{print $4}')\"",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -253,6 +428,8 @@ def _quark_auto_upload():
     try:
         if quark_bridge:
             result = quark_bridge.run_upload()
+            if result.get("busy"):
+                return
     except Exception:
         result = {"ok": False, "message": "upload failed"}
     _notify_quark(result)
@@ -271,7 +448,7 @@ def run_backup(hid):
         try:
             r = subprocess.run(
                 [str(CODE_DIR / "backup-one.sh"), hid],
-                capture_output=True, text=True, timeout=600,
+                capture_output=True, text=True, timeout=JOB_TIMEOUT,
                 env={**os.environ, "GROK_BACKUP_ROOT": str(ROOT), "GROK_BACKUP_BINDIR": str(CODE_DIR)},
             )
             if r.returncode != 0:
@@ -340,7 +517,7 @@ def run_restore(hid, name):
         try:
             r = subprocess.run(
                 [str(CODE_DIR / "restore-one.sh"), hid, name],
-                capture_output=True, text=True, timeout=600,
+                capture_output=True, text=True, timeout=JOB_TIMEOUT,
                 env={**os.environ, "GROK_BACKUP_ROOT": str(ROOT), "GROK_BACKUP_BINDIR": str(CODE_DIR)},
             )
             if r.returncode != 0:
@@ -553,9 +730,7 @@ HTML = r"""<!doctype html>
       <p>按各机频率自动备份</p>
     </div>
     <div class="hosts" id="hosts"></div>
-    <a class="host" id="quarknav" href="#quark"><i class="dot"></i><div><b>夸克网盘</b><span>异地副本</span></div></a>
-    <a class="host" id="notifynav" href="#notify"><i class="dot"></i><div><b>通知</b><span>备份结果</span></div></a>
-    <button class="add" id="add">添加 VPS</button>
+    <a class="host" id="settingsnav" href="#settings"><i class="dot"></i><div><b>设置</b><span>访问 · 夸克 · 通知</span></div></a>
     <div class="aside-foot" id="foot"></div>
   </aside>
   <main>
@@ -639,7 +814,7 @@ HTML = r"""<!doctype html>
 </dialog>
 <script>
 const token = new URLSearchParams(location.search).get("t") || "";
-let selected = (location.hash === "#quark") ? "quark" : ((location.hash === "#notify") ? "notify" : "overview");
+let selected = "overview";
 let hosts = [];
 let paths = [];
 let mode = "add";
@@ -750,12 +925,16 @@ function renderChips(){
 }
 
 function currentView(){
-  if (location.hash === "#quark") return "quark";
-  if (location.hash === "#notify") return "notify";
-  const id = location.hash.replace(/^#/, "");
+  let id = location.hash.replace(/^#/, "");
+  if (id === "quark" || id === "notify") {
+    const url = new URL(location.href);
+    url.hash = "settings";
+    history.replaceState(null, "", url);
+    id = "settings";
+  }
+  if (id === "settings") return "settings";
   if (id && hosts.find(h => h.id === id)) return id;
-  if (selected === "quark") return "quark";
-  if (selected === "notify") return "notify";
+  if (selected === "settings") return "settings";
   if (selected && hosts.find(h => h.id === selected)) return selected;
   return "overview";
 }
@@ -772,9 +951,10 @@ async function load(){
   const data = await api("/api/state");
   hosts = data.hosts || [];
   window._disk = data.disk;
+  if (data.access) window._access = data.access;
   selected = currentView();
   render(data);
-  if (selected === "notify") loadNotify();
+  if (selected === "settings") loadSettings();
 }
 
 function renderOverview(){
@@ -836,15 +1016,17 @@ function goOverview(){
   setView("overview");
   render();
 }
-function goQuark(){
-  setView("quark");
+function goSettings(){
+  setView("settings");
   render();
-  loadQuark();
+  loadSettings();
 }
-function goNotify(){
-  setView("notify");
-  render();
-  loadNotify();
+async function loadAccess(){
+  try {
+    window._access = await api("/api/access");
+  } catch (e) {
+    window._access = Object.assign({tailscale:false, urls:[], ip:"", dns:"", message:String(e)}, window._access || {});
+  }
 }
 async function loadQuark(){
   try {
@@ -852,85 +1034,6 @@ async function loadQuark(){
   } catch (e) {
     window._quark = {logged_in:false, message:String(e)};
   }
-  if (selected === "quark") renderQuark();
-}
-function renderQuark(){
-  const q = window._quark || {};
-  const run = document.getElementById("run");
-  const rm = document.getElementById("remove");
-  const ed = document.getElementById("edit");
-  const list = document.getElementById("list");
-  const toast = document.getElementById("toast");
-  const badge = document.getElementById("badge");
-  const stats = document.getElementById("stats");
-  const job = document.getElementById("job");
-  document.getElementById("back").hidden = false;
-  document.getElementById("title").textContent = "夸克网盘";
-  document.getElementById("sub").textContent = "把本机备份目录传到夸克，当作异地副本";
-  badge.hidden = false;
-  badge.className = "badge " + (q.logged_in ? "ok" : "warn");
-  badge.textContent = q.logged_in ? "已登录" : "未登录";
-  document.getElementById("keeprow").hidden = true;
-  run.hidden = false;
-  run.disabled = !q.logged_in;
-  run.textContent = "立即上传";
-  rm.hidden = true; ed.hidden = true;
-  toast.className = "toast";
-  toast.textContent = "";
-  stats.hidden = false;
-  stats.innerHTML = `
-    <div class="stat"><i>账号</i><b>${esc(q.nickname || "未登录")}</b></div>
-    <div class="stat"><i>空间</i><b>${esc(q.space || "—")}</b></div>
-    <div class="stat"><i>网盘目录</i><b>${esc(q.remote_dir || "VPS备份")}</b></div>
-    <div class="stat"><i>自动上传</i><b>${q.auto ? "开" : "关"}</b></div>
-    <div class="stat"><i>云端保留</i><b>每台 ${q.keep_remote || 3} 份</b></div>`;
-  job.hidden = true;
-  list.className = "";
-  const loginBit = q.logged_in ? `
-      <p class="hint" style="margin-top:8px">已授权。云端每台机器留最近 3 份，新的覆盖最旧的。不会覆盖远端 VPS。</p>` : `
-      <p class="hint" style="margin-top:8px">打开授权地址，把页面上的授权码贴回来。只在夸克 APP 里扫码登录还不够。</p>
-      <p class="hint" id="quarkurl">${q.url ? '<a href="'+esc(q.url)+'" target="_blank">打开授权页</a>' : ""}</p>
-      <label>授权码</label>
-      <input id="quarkcode" placeholder="粘贴授权码">
-      <div class="row" style="margin-top:10px">
-        <button type="button" id="quarklogin">获取授权地址</button>
-        <button type="button" class="primary" id="quarktoken">提交授权码</button>
-      </div>`;
-  const logText = q.logged_in ? "" : (q.message || "");
-  list.innerHTML = `
-    <div class="stat" style="margin-bottom:12px">
-      <i>上传来源</i><b>__GROK_HOSTS_DIR__</b>
-      ${loginBit}
-      <label>网盘目录名</label>
-      <input id="quarkdir" value="${esc(q.remote_dir || "VPS备份")}">
-      <div class="row" style="margin-top:10px">
-        <button type="button" id="quarksave">保存设置</button>
-        <button type="button" id="quarkauto">${q.auto ? "关闭自动上传" : "开启自动上传"}</button>
-      </div>
-      <pre id="quarklog" style="margin-top:12px;white-space:pre-wrap">${esc(logText)}</pre>
-    </div>`;
-  const loginBtn = document.getElementById("quarklogin");
-  const tokenBtn = document.getElementById("quarktoken");
-  if (loginBtn) loginBtn.onclick = async () => {
-    const r = await api("/api/quark/login-start", {method:"POST"});
-    window._quark = Object.assign({}, q, r, {logged_in: false});
-    renderQuark();
-  };
-  if (tokenBtn) tokenBtn.onclick = async () => {
-    const code = document.getElementById("quarkcode").value.trim();
-    const r = await api("/api/quark/login", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({token: code})});
-    await loadQuark();
-    document.getElementById("toast").textContent = r.ok ? "登录成功" : (r.message || "登录失败");
-    document.getElementById("toast").className = "toast" + (r.ok ? "" : " err");
-  };
-  document.getElementById("quarksave").onclick = async () => {
-    await api("/api/quark/setup", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({remote_dir: document.getElementById("quarkdir").value})});
-    loadQuark();
-  };
-  document.getElementById("quarkauto").onclick = async () => {
-    await api("/api/quark/setup", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({auto: !q.auto})});
-    loadQuark();
-  };
 }
 async function loadNotify(){
   try {
@@ -938,7 +1041,10 @@ async function loadNotify(){
   } catch (e) {
     window._notify = {events:{}, telegram:{bot_token:{}}, feishu:{webhook:{}}, webhook:{url:{}, secret:{}}, message:String(e)};
   }
-  if (selected === "notify") renderNotify();
+}
+async function loadSettings(){
+  await Promise.all([loadAccess(), loadQuark(), loadNotify()]);
+  if (selected === "settings") renderSettings();
 }
 function evOn(n, key){
   const ev = (n && n.events) || {};
@@ -975,92 +1081,7 @@ function notifyEvents(){
     "quark.failed": document.getElementById("ev-qf").checked
   };
 }
-function renderNotify(){
-  const n = window._notify || {};
-  const tg = n.telegram || {};
-  const fs = n.feishu || {};
-  const wh = n.webhook || {};
-  const run = document.getElementById("run");
-  const rm = document.getElementById("remove");
-  const ed = document.getElementById("edit");
-  const list = document.getElementById("list");
-  const toast = document.getElementById("toast");
-  const badge = document.getElementById("badge");
-  const stats = document.getElementById("stats");
-  const job = document.getElementById("job");
-  const onCount = [tg.enabled, fs.enabled, wh.enabled].filter(Boolean).length;
-  document.getElementById("back").hidden = false;
-  document.getElementById("title").textContent = "通知";
-  document.getElementById("sub").textContent = "备份、恢复、夸克上传完成后推送。发送失败不影响备份。";
-  badge.hidden = false;
-  badge.className = "badge " + (onCount ? "ok" : "warn");
-  badge.textContent = onCount ? (onCount + " 个通道已启用") : "未启用";
-  document.getElementById("keeprow").hidden = true;
-  run.hidden = true; rm.hidden = true; ed.hidden = true;
-  toast.className = "toast";
-  toast.textContent = "";
-  stats.hidden = false;
-  stats.innerHTML = `
-    <div class="stat"><i>Telegram</i><b>${tg.enabled ? "开" : "关"}</b></div>
-    <div class="stat"><i>飞书</i><b>${fs.enabled ? "开" : "关"}</b></div>
-    <div class="stat"><i>Webhook</i><b>${wh.enabled ? "开" : "关"}</b></div>
-    <div class="stat"><i>成功通知</i><b>${evOn(n,"backup.success") && evOn(n,"restore.success") && evOn(n,"quark.success") ? "开" : "部分关闭"}</b></div>`;
-  job.hidden = true;
-  list.className = "";
-  list.innerHTML = `
-    <div class="chan">
-      <h3>事件</h3>
-      <p class="hint">失败建议保持开启；成功可按需关掉。</p>
-      <div class="checks">
-        <label><input type="checkbox" id="ev-bs" ${evOn(n,"backup.success") ? "checked" : ""}>备份成功</label>
-        <label><input type="checkbox" id="ev-bf" ${evOn(n,"backup.failed") ? "checked" : ""}>备份失败</label>
-        <label><input type="checkbox" id="ev-rs" ${evOn(n,"restore.success") ? "checked" : ""}>恢复成功</label>
-        <label><input type="checkbox" id="ev-rf" ${evOn(n,"restore.failed") ? "checked" : ""}>恢复失败</label>
-        <label><input type="checkbox" id="ev-qs" ${evOn(n,"quark.success") ? "checked" : ""}>夸克成功</label>
-        <label><input type="checkbox" id="ev-qf" ${evOn(n,"quark.failed") ? "checked" : ""}>夸克失败</label>
-      </div>
-    </div>
-    <div class="chan">
-      <h3>Telegram</h3>
-      <p class="hint">用 BotFather 建机器人，把 Bot Token 和 chat_id 填这里。</p>
-      <label class="toggle"><input type="checkbox" id="tg-on" ${tg.enabled ? "checked" : ""}>启用</label>
-      <label>Bot Token</label>
-      <input id="tg-token" type="password" autocomplete="off" placeholder="${tg.bot_token && tg.bot_token.configured ? "已保存 ·••••" + esc(last4(tg.bot_token)) : "123456:ABC…"}">
-      <p class="secret-hint">${secretHint(tg.bot_token, "不会在页面或接口里回传完整 token。")}</p>
-      <label>Chat ID</label>
-      <input id="tg-chat" value="${esc(tg.chat_id || "")}" placeholder="123456789">
-      <div class="row">
-        <button type="button" class="primary" id="tg-save">保存</button>
-        <button type="button" id="tg-test">发送测试</button>
-      </div>
-    </div>
-    <div class="chan">
-      <h3>飞书 / Lark</h3>
-      <p class="hint">群里添加自定义机器人，粘贴 webhook 地址。</p>
-      <label class="toggle"><input type="checkbox" id="fs-on" ${fs.enabled ? "checked" : ""}>启用</label>
-      <label>Webhook</label>
-      <input id="fs-hook" type="password" autocomplete="off" placeholder="${fs.webhook && fs.webhook.configured ? "已保存 ·••••" + esc(last4(fs.webhook)) : "https://open.feishu.cn/open-apis/bot/v2/hook/…"}">
-      <p class="secret-hint">${secretHint(fs.webhook, "地址里带密钥，保存后只显示末四位。")}</p>
-      <div class="row">
-        <button type="button" class="primary" id="fs-save">保存</button>
-        <button type="button" id="fs-test">发送测试</button>
-      </div>
-    </div>
-    <div class="chan">
-      <h3>通用 Webhook</h3>
-      <p class="hint">POST JSON，可选 HMAC-SHA256 签名。事件名见 README。</p>
-      <label class="toggle"><input type="checkbox" id="wh-on" ${wh.enabled ? "checked" : ""}>启用</label>
-      <label>URL</label>
-      <input id="wh-url" type="password" autocomplete="off" placeholder="${wh.url && wh.url.configured ? "已保存 ·••••" + esc(last4(wh.url)) : "https://example.com/hook"}">
-      <p class="secret-hint">${secretHint(wh.url, "完整 URL 不会出现在状态接口里。")}</p>
-      <label>签名密钥（可选）</label>
-      <input id="wh-secret" type="password" autocomplete="off" placeholder="${wh.secret && wh.secret.configured ? "已保存 ·••••" + esc(last4(wh.secret)) : "留空则不签名"}">
-      <p class="secret-hint">${secretHint(wh.secret, "若填写，请求头会带 X-Webhook-Signature: sha256=…")}</p>
-      <div class="row">
-        <button type="button" class="primary" id="wh-save">保存</button>
-        <button type="button" id="wh-test">发送测试</button>
-      </div>
-    </div>`;
+function bindNotifyHandlers(){
   document.querySelectorAll(".checks input").forEach(el => {
     el.onchange = async () => {
       try {
@@ -1074,7 +1095,7 @@ function renderNotify(){
   const saveChan = async (label, payload) => {
     try {
       window._notify = await api("/api/notify/setup", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
-      renderNotify();
+      renderSettings();
       document.getElementById("toast").textContent = label + " 已保存";
       document.getElementById("toast").className = "toast";
     } catch (e) {
@@ -1107,15 +1128,179 @@ function renderNotify(){
   document.getElementById("fs-test").onclick = () => testCh("feishu");
   document.getElementById("wh-test").onclick = () => testCh("webhook");
 }
+function bindQuarkHandlers(){
+  const q = window._quark || {};
+  const loginBtn = document.getElementById("quarklogin");
+  const tokenBtn = document.getElementById("quarktoken");
+  if (loginBtn) loginBtn.onclick = async () => {
+    const r = await api("/api/quark/login-start", {method:"POST"});
+    window._quark = Object.assign({}, q, r, {logged_in: false});
+    renderSettings();
+  };
+  if (tokenBtn) tokenBtn.onclick = async () => {
+    const code = document.getElementById("quarkcode").value.trim();
+    const r = await api("/api/quark/login", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({token: code})});
+    await loadQuark();
+    if (selected === "settings") renderSettings();
+    document.getElementById("toast").textContent = r.ok ? "登录成功" : (r.message || "登录失败");
+    document.getElementById("toast").className = "toast" + (r.ok ? "" : " err");
+  };
+  const saveBtn = document.getElementById("quarksave");
+  if (saveBtn) saveBtn.onclick = async () => {
+    await api("/api/quark/setup", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({remote_dir: document.getElementById("quarkdir").value})});
+    await loadQuark();
+    if (selected === "settings") renderSettings();
+  };
+  const autoBtn = document.getElementById("quarkauto");
+  if (autoBtn) autoBtn.onclick = async () => {
+    await api("/api/quark/setup", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({auto: !q.auto})});
+    await loadQuark();
+    if (selected === "settings") renderSettings();
+  };
+  const runBtn = document.getElementById("quarkrun");
+  if (runBtn) runBtn.onclick = async () => {
+    const r = await api("/api/quark/run", {method:"POST"});
+    document.getElementById("toast").textContent = r.busy ? "已有上传在进行" : (r.ok ? "上传完成" : (r.message || "上传失败"));
+    document.getElementById("toast").className = "toast" + (r.ok && !r.busy ? "" : " err");
+    await loadQuark();
+    if (selected === "settings") renderSettings();
+  };
+}
+function renderSettings(){
+  const a = window._access || {};
+  const q = window._quark || {};
+  const n = window._notify || {};
+  const tg = n.telegram || {};
+  const fs = n.feishu || {};
+  const wh = n.webhook || {};
+  const onCount = [tg.enabled, fs.enabled, wh.enabled].filter(Boolean).length;
+  document.getElementById("back").hidden = false;
+  document.getElementById("title").textContent = "设置";
+  document.getElementById("sub").textContent = "添加机器、可选 Tailscale、夸克上传、完成通知";
+  const badge = document.getElementById("badge");
+  badge.hidden = false;
+  badge.className = "badge " + (a.tailscale || q.logged_in || onCount ? "ok" : "warn");
+  badge.textContent = a.tailscale ? "Tailscale 开" : "仅本机";
+  document.getElementById("keeprow").hidden = true;
+  document.getElementById("run").hidden = true;
+  document.getElementById("remove").hidden = true;
+  document.getElementById("edit").hidden = true;
+  document.getElementById("toast").className = "toast";
+  const stats = document.getElementById("stats");
+  stats.hidden = false;
+  stats.innerHTML = `
+    <div class="stat"><i>访问</i><b>${a.tailscale ? "本机 + Tailscale" : "仅 127.0.0.1"}</b></div>
+    <div class="stat"><i>夸克</i><b>${q.logged_in ? esc(q.nickname || "已登录") : "未登录"}</b></div>
+    <div class="stat"><i>自动上传</i><b>${q.auto ? "开" : "关"}</b></div>
+    <div class="stat"><i>通知</i><b>${onCount ? (onCount + " 个通道") : "未启用"}</b></div>`;
+  document.getElementById("job").hidden = true;
+  const tsUrls = (a.urls || []).filter(u => u && !u.includes("127.0.0.1"));
+  const tsHint = a.message ? esc(a.message) : (tsUrls.length ? tsUrls.map(u => esc(u)).join(" · ") : "开启后会监听 tailscale0，并在设置页显示检测到的地址。");
+  const loginBit = q.logged_in ? `
+      <p class="hint">已授权。云端每台留最近 ${esc(q.keep_remote || 3)} 份，新的覆盖最旧槽。上传进行中时不会重做暂存。</p>` : `
+      <p class="hint">打开授权地址，把页面上的授权码贴回来。只在夸克 APP 里扫码还不够。</p>
+      <p class="hint">${q.url ? '<a href="'+esc(q.url)+'" target="_blank" rel="noreferrer">打开授权页</a>' : ""}</p>
+      <label>授权码</label>
+      <input id="quarkcode" placeholder="粘贴授权码">
+      <div class="row" style="margin-top:10px">
+        <button type="button" id="quarklogin">获取授权地址</button>
+        <button type="button" class="primary" id="quarktoken">提交授权码</button>
+      </div>`;
+  const list = document.getElementById("list");
+  list.className = "";
+  list.innerHTML = `
+    <div class="chan">
+      <h3>机器</h3>
+      <p class="hint">添加后会出现在左侧。密钥写到数据目录，不会进仓库。</p>
+      <div class="row"><button type="button" class="primary" id="addvps">添加 VPS</button></div>
+    </div>
+    <div class="chan">
+      <h3>Tailscale</h3>
+      <p class="hint">默认只绑 127.0.0.1。打开后额外监听 tailscale0 的 IPv4，并把 Tailscale 网段当作本机（免 token）。不会绑 0.0.0.0。</p>
+      <label class="toggle"><input type="checkbox" id="ts-on" ${a.tailscale ? "checked" : ""}>允许 Tailscale 访问</label>
+      <p class="hint" id="ts-urls">${tsHint}</p>
+    </div>
+    <div class="chan">
+      <h3>夸克网盘</h3>
+      <p class="hint">把本机最新备份传到夸克当异地副本。来源：__GROK_HOSTS_DIR__</p>
+      ${loginBit}
+      <label>网盘目录名</label>
+      <input id="quarkdir" value="${esc(q.remote_dir || "VPS备份")}">
+      <div class="row" style="margin-top:10px">
+        <button type="button" id="quarksave">保存目录</button>
+        <button type="button" id="quarkauto">${q.auto ? "关闭自动上传" : "开启自动上传"}</button>
+        <button type="button" class="primary" id="quarkrun" ${q.logged_in ? "" : "disabled"}>立即上传</button>
+      </div>
+      <pre id="quarklog" style="margin-top:12px;white-space:pre-wrap">${q.logged_in ? "" : esc(q.message || "")}</pre>
+    </div>
+    <div class="chan">
+      <h3>通知事件</h3>
+      <p class="hint">失败建议保持开启；成功可按需关掉。发送失败不影响备份。</p>
+      <div class="checks">
+        <label><input type="checkbox" id="ev-bs" ${evOn(n,"backup.success") ? "checked" : ""}>备份成功</label>
+        <label><input type="checkbox" id="ev-bf" ${evOn(n,"backup.failed") ? "checked" : ""}>备份失败</label>
+        <label><input type="checkbox" id="ev-rs" ${evOn(n,"restore.success") ? "checked" : ""}>恢复成功</label>
+        <label><input type="checkbox" id="ev-rf" ${evOn(n,"restore.failed") ? "checked" : ""}>恢复失败</label>
+        <label><input type="checkbox" id="ev-qs" ${evOn(n,"quark.success") ? "checked" : ""}>夸克成功</label>
+        <label><input type="checkbox" id="ev-qf" ${evOn(n,"quark.failed") ? "checked" : ""}>夸克失败</label>
+      </div>
+    </div>
+    <div class="chan">
+      <h3>Telegram</h3>
+      <p class="hint">用 BotFather 建机器人，填 Bot Token 和 chat_id。</p>
+      <label class="toggle"><input type="checkbox" id="tg-on" ${tg.enabled ? "checked" : ""}>启用</label>
+      <label>Bot Token</label>
+      <input id="tg-token" type="password" autocomplete="off" placeholder="${tg.bot_token && tg.bot_token.configured ? "已保存 ·••••" + esc(last4(tg.bot_token)) : "123456:ABC…"}">
+      <p class="secret-hint">${secretHint(tg.bot_token, "状态接口只回末四位。")}</p>
+      <label>Chat ID</label>
+      <input id="tg-chat" value="${esc(tg.chat_id || "")}" placeholder="123456789">
+      <div class="row">
+        <button type="button" class="primary" id="tg-save">保存</button>
+        <button type="button" id="tg-test">发送测试</button>
+      </div>
+    </div>
+    <div class="chan">
+      <h3>飞书 / Lark</h3>
+      <p class="hint">群里添加自定义机器人，粘贴 webhook。</p>
+      <label class="toggle"><input type="checkbox" id="fs-on" ${fs.enabled ? "checked" : ""}>启用</label>
+      <label>Webhook</label>
+      <input id="fs-hook" type="password" autocomplete="off" placeholder="${fs.webhook && fs.webhook.configured ? "已保存 ·••••" + esc(last4(fs.webhook)) : "https://open.feishu.cn/open-apis/bot/v2/hook/…"}">
+      <p class="secret-hint">${secretHint(fs.webhook, "保存后只显示末四位。")}</p>
+      <div class="row">
+        <button type="button" class="primary" id="fs-save">保存</button>
+        <button type="button" id="fs-test">发送测试</button>
+      </div>
+    </div>
+    <div class="chan">
+      <h3>通用 Webhook</h3>
+      <p class="hint">POST JSON。可选 HMAC-SHA256。事件名见 README。</p>
+      <label class="toggle"><input type="checkbox" id="wh-on" ${wh.enabled ? "checked" : ""}>启用</label>
+      <label>URL</label>
+      <input id="wh-url" type="password" autocomplete="off" placeholder="${wh.url && wh.url.configured ? "已保存 ·••••" + esc(last4(wh.url)) : "https://example.com/hook"}">
+      <p class="secret-hint">${secretHint(wh.url, "完整 URL 不会出现在状态接口里。")}</p>
+      <label>签名密钥（可选）</label>
+      <input id="wh-secret" type="password" autocomplete="off" placeholder="${wh.secret && wh.secret.configured ? "已保存 ·••••" + esc(last4(wh.secret)) : "留空则不签名"}">
+      <p class="secret-hint">${secretHint(wh.secret, "填写后请求头带 X-Webhook-Signature: sha256=…")}</p>
+      <div class="row">
+        <button type="button" class="primary" id="wh-save">保存</button>
+        <button type="button" id="wh-test">发送测试</button>
+      </div>
+    </div>`;
+  document.getElementById("addvps").onclick = () => openDlg("add");
+  document.getElementById("ts-on").onchange = async () => {
+    window._access = await api("/api/access", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({tailscale: document.getElementById("ts-on").checked})});
+    renderSettings();
+  };
+  bindQuarkHandlers();
+  bindNotifyHandlers();
+}
 function render(data){
   renderAlerts(data || {disk: window._disk, hosts});
   if (data && data.disk) window._disk = data.disk;
   const box = document.getElementById("hosts");
   document.getElementById("brand").className = "brand" + (selected === "overview" ? " on" : "");
-  const qn = document.getElementById("quarknav");
-  if (qn) qn.className = "host" + (selected === "quark" ? " active" : "");
-  const nn = document.getElementById("notifynav");
-  if (nn) nn.className = "host" + (selected === "notify" ? " active" : "");
+  const sn = document.getElementById("settingsnav");
+  if (sn) sn.className = "host" + (selected === "settings" ? " active" : "");
   box.innerHTML = hosts.map(h => {
     const st = statusOf(h);
     const sub = h.running ? "正在备份" : (h.last ? rel(h.last) : "还没有备份");
@@ -1125,8 +1310,7 @@ function render(data){
     </button>`;
   }).join("");
   box.querySelectorAll(".host").forEach(el => el.onclick = () => { setView(el.dataset.id); render(data); });
-  if (qn) qn.onclick = (e) => { e.preventDefault(); goQuark(); };
-  if (nn) nn.onclick = (e) => { e.preventDefault(); goNotify(); };
+  if (sn) sn.onclick = (e) => { e.preventDefault(); goSettings(); };
   const total = hosts.reduce((n,h) => n + (h.bytes||0), 0);
   const disk = (data && data.disk) || window._disk;
   document.getElementById("foot").textContent =
@@ -1136,12 +1320,8 @@ function render(data){
     renderOverview();
     return;
   }
-  if (selected === "quark"){
-    renderQuark();
-    return;
-  }
-  if (selected === "notify"){
-    renderNotify();
+  if (selected === "settings"){
+    renderSettings();
     return;
   }
   const h = hosts.find(x => x.id === selected);
@@ -1250,7 +1430,7 @@ function render(data){
 function saveKeep(n){
   n = Math.max(1, Math.min(30, Number(n || 7)));
   document.getElementById("keep").value = n;
-  if (!selected || selected === "overview" || selected === "quark" || selected === "notify") return;
+  if (!selected || selected === "overview" || selected === "settings") return;
   clearTimeout(keepTimer);
   keepTimer = setTimeout(async () => {
     await api("/api/hosts/keep?id=" + encodeURIComponent(selected) + "&keep=" + encodeURIComponent(n), {method:"POST"});
@@ -1303,13 +1483,7 @@ document.getElementById("run").onclick = async () => {
   if (!selected) return;
   if (selected === "overview") {
     await api("/api/backup-all", {method:"POST"});
-  } else if (selected === "notify") {
-    return;
-  } else if (selected === "quark") {
-    const r = await api("/api/quark/run", {method:"POST"});
-    document.getElementById("toast").textContent = r.ok ? "上传完成" : (r.message || "上传失败");
-    document.getElementById("toast").className = "toast" + (r.ok ? "" : " err");
-    loadQuark();
+  } else if (selected === "settings") {
     return;
   } else {
     await api("/api/backup?id=" + encodeURIComponent(selected), {method:"POST"});
@@ -1334,9 +1508,7 @@ document.getElementById("remove").onclick = async () => {
 };
 document.getElementById("brand").onclick = goOverview;
 document.getElementById("back").onclick = goOverview;
-document.getElementById("quarknav").onclick = goQuark;
-document.getElementById("notifynav").onclick = goNotify;
-document.getElementById("add").onclick = () => openDlg("add");
+document.getElementById("settingsnav").onclick = (e) => { e.preventDefault(); goSettings(); };
 document.getElementById("testbtn").onclick = async () => {
   const f = document.getElementById("form");
   const keyfile = f.keyfile.files[0];
@@ -1395,13 +1567,12 @@ document.getElementById("form").onsubmit = async (e) => {
 window.addEventListener("hashchange", () => {
   selected = currentView();
   render();
-  if (selected === "quark") loadQuark();
-  if (selected === "notify") loadNotify();
+  if (selected === "settings") loadSettings();
 });
 load();
 setInterval(() => {
   if (document.querySelector("dialog[open]")) return;
-  if (selected === "quark" || selected === "notify") return;
+  if (selected === "settings") return;
   load();
 }, 2500);
 </script>
@@ -1412,9 +1583,10 @@ HTML = HTML.replace("__GROK_HOSTS_DIR__", str(ROOT / "hosts"))
 
 
 def check_token(qs, handler=None):
-    if handler and handler.client_address and handler.client_address[0] in ("127.0.0.1", "::1"):
+    if handler and trusted_client(handler):
         return True
-    return (qs.get("t") or [""])[0] == TOKEN
+    got = (qs.get("t") or [""])[0]
+    return secrets.compare_digest(got, TOKEN)
 
 
 class BodyTooLarge(Exception):
@@ -1446,15 +1618,23 @@ def parse_paths(raw):
 
 def apply_fields(rec, body):
     if body.get("name"):
-        rec["name"] = body["name"].strip()
+        rec["name"] = body["name"].strip()[:80]
     if body.get("host"):
-        rec["host"] = body["host"].strip()
+        host = body["host"].strip()
+        if HOST_RE.match(host):
+            rec["host"] = host
     if body.get("user"):
-        rec["user"] = body["user"].strip()
+        user = body["user"].strip()
+        if USER_RE.match(user):
+            rec["user"] = user
     if body.get("port") is not None and body.get("port") != "":
-        rec["port"] = int(body.get("port") or 22)
+        try:
+            port = int(body.get("port") or 22)
+        except (TypeError, ValueError):
+            port = 22
+        rec["port"] = port if 1 <= port <= 65535 else 22
     if "domain" in body:
-        rec["domain"] = (body.get("domain") or "").strip()
+        rec["domain"] = (body.get("domain") or "").strip()[:253]
     if body.get("paths") or body.get("paths") == "":
         rec["paths"] = parse_paths(body.get("paths") or "")
     if body.get("keep") is not None and body.get("keep") != "":
@@ -1465,14 +1645,10 @@ def apply_fields(rec, body):
     if pem.strip():
         key_dir = ROOT / "keys"
         key_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            key_dir.chmod(0o700)
-        except Exception:
-            pass
-        key_path = str(key_dir / f"{rec['id']}.pem")
-        Path(key_path).write_text(pem if pem.endswith("\n") else pem + "\n")
-        Path(key_path).chmod(0o600)
-        rec["key"] = key_path
+        _chmod(key_dir, 0o700)
+        key_path = key_dir / f"{rec['id']}.pem"
+        _atomic_write(key_path, pem if pem.endswith("\n") else pem + "\n")
+        rec["key"] = str(key_path)
     return rec
 
 
@@ -1480,9 +1656,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         return
 
+    def _sec(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+
     def _deny(self, code=401, msg="unauthorized"):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self._sec()
         self.end_headers()
         self.wfile.write(msg.encode())
 
@@ -1490,7 +1673,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
+        self._sec()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -1503,7 +1686,7 @@ class Handler(BaseHTTPRequestHandler):
             body = HTML.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
+            self._sec()
             self.end_headers()
             self.wfile.write(body)
             return
@@ -1528,20 +1711,25 @@ class Handler(BaseHTTPRequestHandler):
                     "next": host_next(h),
                     "fail": read_fail(hid),
                 })
-            return self._json({"hosts": out, "disk": disk_info()})
+            return self._json({"hosts": out, "disk": disk_info(), "access": access_public()})
+        if u.path == "/api/access":
+            if not check_token(qs, self):
+                return self._deny()
+            return self._json(access_public())
         if u.path.startswith("/dl/"):
             if not check_token(qs, self):
                 return self._deny()
             parts = [unquote(x) for x in u.path.split("/") if x and x != "dl"]
-            if len(parts) != 2 or not ID_RE.match(parts[0]) or not FILE_RE.match(parts[1]):
+            if len(parts) != 2:
                 return self._deny(400, "bad name")
-            p = dest_for(parts[0]) / parts[1]
-            if not p.is_file() or not parts[1].startswith(parts[0] + "-"):
+            p = pack_path(parts[0], parts[1])
+            if not p:
                 return self._deny(404, "missing")
             self.send_response(200)
             self.send_header("Content-Type", "application/gzip")
             self.send_header("Content-Disposition", f'attachment; filename="{parts[1]}"')
             self.send_header("Content-Length", str(p.stat().st_size))
+            self._sec()
             self.end_headers()
             with p.open("rb") as f:
                 while True:
@@ -1634,9 +1822,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._deny(400, "host required")
                 pem = body.get("key_pem") or ""
                 if pem.strip():
-                    tmp = Path("/tmp") / f"vps-test-{int(datetime.now().timestamp())}.pem"
-                    tmp.write_text(pem if pem.endswith("\n") else pem + "\n")
-                    tmp.chmod(0o600)
+                    fd, tmp_name = tempfile.mkstemp(prefix="vps-test-", suffix=".pem")
+                    os.fchmod(fd, 0o600)
+                    with os.fdopen(fd, "w") as f:
+                        f.write(pem if pem.endswith("\n") else pem + "\n")
+                    tmp = Path(tmp_name)
                     h["key"] = str(tmp)
                 elif hid and get_host(hid):
                     h["key"] = get_host(hid)["key"]
@@ -1675,11 +1865,22 @@ class Handler(BaseHTTPRequestHandler):
                 auto=body.get("auto"),
                 mode=body.get("mode"),
             ))
+        if u.path == "/api/access":
+            try:
+                body = read_body(self)
+            except BodyTooLarge:
+                return self._deny(413, "payload too large")
+            except Exception:
+                body = {}
+            if "tailscale" in body:
+                save_access({"tailscale": bool(body.get("tailscale"))})
+            return self._json(access_public())
         if u.path == "/api/quark/run":
             if not quark_bridge:
                 return self._deny(500, "no quark")
             result = quark_bridge.run_upload()
-            _notify_quark(result)
+            if not result.get("busy"):
+                _notify_quark(result)
             return self._json(result)
         if u.path == "/api/notify/setup":
             if not notify_mod:
@@ -1718,23 +1919,20 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/restore":
             hid = (qs.get("id") or [""])[0]
             name = (qs.get("name") or [""])[0]
-            if not ID_RE.match(hid) or not FILE_RE.match(name) or not name.startswith(hid + "-"):
+            if not pack_path(hid, name):
                 return self._deny(400, "bad name")
             if not get_host(hid):
                 return self._deny(400, "bad name")
-            if not (dest_for(hid) / name).is_file():
-                return self._deny(404, "missing")
             if not run_restore(hid, name):
                 return self._deny(409, "busy")
             return self._json({"ok": True})
         if u.path == "/api/delete":
             hid = (qs.get("id") or [""])[0]
             name = (qs.get("name") or [""])[0]
-            if not ID_RE.match(hid) or not FILE_RE.match(name) or not name.startswith(hid + "-"):
+            p = pack_path(hid, name)
+            if not p:
                 return self._deny(400, "bad name")
-            p = dest_for(hid) / name
-            if p.is_file():
-                p.unlink()
+            p.unlink()
             side = p.with_name(p.name + ".json")
             if side.is_file():
                 side.unlink()
@@ -1775,10 +1973,16 @@ class Handler(BaseHTTPRequestHandler):
             host = (body.get("host") or "").strip()
             if not name or not host:
                 return self._deny(400, "name/host required")
+            if not HOST_RE.match(host):
+                return self._deny(400, "bad host")
             hid = slug(name)
             data = load_hosts()
-            if any(h["id"] == hid for h in data["hosts"]):
-                hid = hid + "-2"
+            base, n = hid, 2
+            while any(h["id"] == hid for h in data["hosts"]):
+                hid = (base + "-" + str(n))[:32]
+                n += 1
+                if not ID_RE.match(hid):
+                    hid = "vps-" + str(n)
             rec = {
                 "id": hid,
                 "name": name,
@@ -1802,5 +2006,8 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     threading.Thread(target=scheduler_loop, daemon=True).start()
     httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print("backup-ui listening on 127.0.0.1:8787", flush=True)
+    print("backup-ui listening on 127.0.0.1:%s" % PORT, flush=True)
+    sync_tailscale_bind()
+    if _ts_bind_ip:
+        print("backup-ui also listening on %s:%s" % (_ts_bind_ip, PORT), flush=True)
     httpd.serve_forever()
