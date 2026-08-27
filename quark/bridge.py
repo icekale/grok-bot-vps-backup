@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 CODE = Path(__file__).resolve().parent
@@ -14,6 +15,8 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / 
 HOSTS = ROOT / "hosts"
 STAGE = ROOT / "quark" / "stage"
 HOME = str(Path.home())
+UPLOAD_TIMEOUT = 4 * 3600
+_upload_lock = threading.Lock()
 ENV = {
     **os.environ,
     "HOME": HOME,
@@ -35,6 +38,10 @@ def load_settings():
 def save_settings(data):
     SETTINGS.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    try:
+        SETTINGS.chmod(0o600)
+    except OSError:
+        pass
 
 
 def load_config():
@@ -78,6 +85,10 @@ def stage_latest():
             if p.is_file() or p.is_symlink():
                 p.unlink()
     STAGE.mkdir(parents=True, exist_ok=True)
+    try:
+        STAGE.chmod(0o700)
+    except OSError:
+        pass
     staged = []
     if not HOSTS.exists():
         return staged
@@ -148,7 +159,10 @@ def login_finish(token):
 def save_prefs(remote_dir=None, auto=None, mode=None, keep=None):
     cfg = load_config()
     if remote_dir is not None:
-        cfg["remote_dir"] = remote_dir.strip() or "VPS备份"
+        d = remote_dir.strip().replace("\\", "/").strip("/")
+        if "/" in d or ".." in d:
+            d = (d.split("/")[0] or "VPS备份")
+        cfg["remote_dir"] = d or "VPS备份"
     if mode in ("direct", "archive"):
         cfg["backup_mode"] = mode
     cfg.setdefault("version", 2)
@@ -168,11 +182,16 @@ def save_prefs(remote_dir=None, auto=None, mode=None, keep=None):
 
 
 def run_upload():
-    staged = stage_latest()
-    if not staged:
-        return {"ok": False, "message": "本机没有可上传的备份包"}
-    r = cmd("run", timeout=600)
-    text = (r.stdout or "") + "\n" + (r.stderr or "")
-    names = ", ".join(x["host"] + ":" + x["dest"] + "<-" + x["src"] for x in staged)
-    ok = r.returncode == 0 and "失败" not in text[-80:]
-    return {"ok": ok, "staged": staged, "keep_remote": keep_remote(), "message": "上传 " + names + "\n" + text[-500:]}
+    if not _upload_lock.acquire(blocking=False):
+        return {"ok": False, "busy": True, "message": "已有上传在进行"}
+    try:
+        staged = stage_latest()
+        if not staged:
+            return {"ok": False, "message": "本机没有可上传的备份包"}
+        r = cmd("run", timeout=UPLOAD_TIMEOUT)
+        text = (r.stdout or "") + "\n" + (r.stderr or "")
+        names = ", ".join(x["host"] + ":" + x["dest"] + "<-" + x["src"] for x in staged)
+        ok = r.returncode == 0 and "失败" not in text[-80:]
+        return {"ok": ok, "staged": staged, "keep_remote": keep_remote(), "message": "上传 " + names + "\n" + text[-500:]}
+    finally:
+        _upload_lock.release()

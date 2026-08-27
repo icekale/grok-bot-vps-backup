@@ -1,12 +1,17 @@
 hosts.json
 hosts/
 notify.json
+access.json
+token
 ui/token
 ui/*.log
 ui/watchdog.pid
 quark/stage/
 quark/settings.json
+stage/
 keys/
+backups/
+logs/
 *.tgz
 *.pem
 .env
